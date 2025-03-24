@@ -152,6 +152,7 @@ class TopOptimizer():
             # 
             # Filtering and Result
             # 
+            rho_prev = np.copy(rho)
             rho[prb.design_elements] = rho_candidate
             # rho_filtered = techniques.apply_density_filter_cKDTree(
             #     rho, prb.mesh, prb.design_elements, radius=cfg.dfilter_radius
@@ -161,8 +162,11 @@ class TopOptimizer():
             )
             rho[prb.design_elements] = rho_filtered[prb.design_elements]
             
+            rho_diff = np.abs(rho - rho_prev)
+            # max_diff = np.max(rho_diff)
+            # mean_diff = np.mean(rho_diff)
             lambda_history.append(lambda_v)
-            dC_drho_ave_history.append(np.average(dc))
+            dC_drho_ave_history.append(np.mean(rho_diff))
             rho_ave_history.append(np.average(rho[prb.design_elements]))
             rho_std_history.append(np.std(rho[prb.design_elements]))
             rho_cout_nonzero.append(np.count_nonzero(rho[prb.design_elements] <= 0.02)) 
@@ -330,8 +334,6 @@ class TopOptimizer():
         self.export_mesh(rho, "last")
         
 
-
-
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
@@ -372,11 +374,18 @@ if __name__ == '__main__':
     parser.add_argument(
         '--dst_path', '-DP', type=str, default="./result/test0", help=''
     )
+    parser.add_argument(
+        '--problem', '-PM', type=str, default="toy2", help=''
+    )
     args = parser.parse_args()
     
 
+    if args.problem == "toy1":
+        prb = problem.toy1()
+    elif args.problem == "toy2":
+        prb = problem.toy2()
     
-    prb = problem.toy1()
+    
     cfg = SIMPConfig(
         args.p, args.vol_frac, args.learning_rate,
         args.lambda_v, args.mu, args.alpha, args.num_iter,
