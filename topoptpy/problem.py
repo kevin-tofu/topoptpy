@@ -162,3 +162,5 @@ def toy1():
         -1000.0,
         design_elements
     )
+
+def toy2():

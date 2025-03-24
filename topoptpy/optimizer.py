@@ -153,12 +153,12 @@ class TopOptimizer():
             # Filtering and Result
             # 
             rho[prb.design_elements] = rho_candidate
-            rho_filtered = techniques.apply_density_filter_cKDTree(
-                rho, prb.mesh, prb.design_elements, radius=cfg.dfilter_radius
-            )
-            # rho_filtered = techniques.helmholtz_filter_element_based_tet(
-            #     rho, basis_rho, cfg.dfilter_radius
+            # rho_filtered = techniques.apply_density_filter_cKDTree(
+            #     rho, prb.mesh, prb.design_elements, radius=cfg.dfilter_radius
             # )
+            rho_filtered = techniques.helmholtz_filter_element_based_tet(
+                rho, basis_rho, cfg.dfilter_radius
+            )
             rho[prb.design_elements] = rho_filtered[prb.design_elements]
             
             lambda_history.append(lambda_v)
