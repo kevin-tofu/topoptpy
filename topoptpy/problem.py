@@ -194,10 +194,10 @@ def toy2():
         basis, (0.0, 0.03), (0.0, y_len), (0.0, z_len)
     ).all()
     F_points = utils.get_point_indices_in_range(
-        basis, (x_len, x_len), (0.0, y_len), (0.0, z_len)
+        basis, (x_len, x_len), (0.0, 0.0), (0.0, z_len)
     )
     F_nodes = utils.get_dofs_in_range(
-        basis, (x_len, x_len), (0.0, y_len), (0.0, z_len)
+        basis, (x_len, x_len), (0.0, 0.0), (0.0, z_len)
     ).nodal['u^3']
     design_elements = utils.get_elements_in_box(
         mesh,
