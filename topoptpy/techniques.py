@@ -96,7 +96,9 @@ def apply_density_filter(
     return rho_new / (weight_sum + 1e-8)
 
 
-def apply_density_filter_cKDTree(rho, mesh, opt_target, radius=0.1):
+def apply_density_filter_cKDTree(
+    rho, mesh, opt_target, radius=0.1
+):
     """
     """
     centers = mesh.p[:, mesh.t[:, opt_target]].mean(axis=1).T  # shape: (n_opt_elem, dim)
@@ -107,7 +109,7 @@ def apply_density_filter_cKDTree(rho, mesh, opt_target, radius=0.1):
         neighbor_elements = [opt_target[j] for j in neighbor_ids]
 
         dists = np.linalg.norm(centers[neighbor_ids] - center, axis=1)
-        weights = radius - dists
+        weights = (radius - dists)
         rho_new[opt_target[i]] = np.sum(weights * rho[neighbor_elements]) / (np.sum(weights) + 1e-8)
 
     return rho_new
@@ -150,14 +152,14 @@ def element_to_element_laplacian_tet(mesh, radius):
     rows = []
     cols = []
     data = []
-
     for i in range(n_elements):
         diag = 0.0
         for j in adjacency[i]:
             dist = np.linalg.norm(element_centers[i] - element_centers[j])
             if dist < 1e-12:
                 continue
-            w = 1.0 / dist
+            # w = 1.0 / (dist + 1e-5)
+            w = np.exp(-dist**2 / (2 * radius**2)) 
             rows.append(i)
             cols.append(j)
             data.append(-w)
@@ -168,7 +170,6 @@ def element_to_element_laplacian_tet(mesh, radius):
 
     laplacian = coo_matrix((data, (rows, cols)), shape=(n_elements, n_elements)).tocsc()
     return laplacian, volumes
-
 
 
 def helmholtz_filter_element_based_tet(rho_element: np.ndarray, basis: Basis, radius: float) -> np.ndarray:

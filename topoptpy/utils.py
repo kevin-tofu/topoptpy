@@ -73,29 +73,46 @@ def get_elements_in_box(
     return np.where(mask)[0]
 
 
+def rho_histo_plot(
+    rho: np.ndarray,
+    dst_path: str
+):
+    plt.clf()
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    ax.hist(rho.flatten(), bins=50)
+    ax.set_xlabel("Density (rho)")
+    ax.set_ylabel("Number of Elements")
+    ax.set_title("Density Distribution")
+    ax.grid(True)
+    fig.savefig(dst_path)
+    plt.close("all")
+
+    
+
 def progress_plot(
     compliance_history,
     dC_drho_ave_history,
     lambda_history,
-    rho_ave_history,
+    dc_ave_history,
+    rho_ave_history, vol_frac,
     rho_std_history,
-    rho_cout_nonzero,
+    rho_cout_nonzero, rho_frac,
     dst_path: str
 ):
     plt.clf()
-    fig, ax = plt.subplots(2, 3, figsize=(12, 8))
+    fig, ax = plt.subplots(2, 4, figsize=(16, 8))
 
     ax[0, 0].plot(compliance_history, marker='o', linestyle='-')
     ax[0, 0].set_xlabel("Iteration")
     ax[0, 0].set_ylabel("Compliance (Objective)")
-    ax[0, 0].set_yscale('log')
+    # ax[0, 0].set_yscale('log')
     ax[0, 0].set_title("Compliance Minimization Progress")
     ax[0, 0].grid(True)
     
     ax[0, 1].plot(dC_drho_ave_history, marker='o', linestyle='-')
     ax[0, 1].set_xlabel("Iteration")
-    ax[0, 1].set_ylabel("Compliance (Objective)")
-    ax[0, 1].set_title("Compliance Minimization Progress")
+    ax[0, 1].set_ylabel("dC")
+    ax[0, 1].set_title("dC Progress")
     ax[0, 1].grid(True)
     
     ax[0, 2].plot(lambda_history, marker='o', linestyle='-')
@@ -103,8 +120,15 @@ def progress_plot(
     ax[0, 2].set_ylabel("Lagrange Multiplier")
     ax[0, 2].set_title("Lagrange Multiplier Progress")
     ax[0, 2].grid(True)
+    
+    ax[0, 3].plot(dc_ave_history, marker='o', linestyle='-')
+    ax[0, 3].set_xlabel("Iteration")
+    ax[0, 3].set_ylabel("dc_ave")
+    ax[0, 3].set_title("dc_ave Progress")
+    ax[0, 3].grid(True)
 
     ax[1, 0].plot(rho_ave_history, marker='o', linestyle='-')
+    ax[1, 0].axhline(y=vol_frac, color='r', linestyle='--', label='threshold')
     ax[1, 0].set_xlabel("Iteration")
     ax[1, 0].set_ylabel("Rho Ave")
     ax[1, 0].set_title("Rho Ave Progress")
@@ -117,6 +141,8 @@ def progress_plot(
     ax[1, 1].grid(True)
     
     ax[1, 2].plot(rho_cout_nonzero, marker='o', linestyle='-')
+    ax[1, 2].axhline(y=rho_frac, color='r', linestyle='--', label='threshold')
+    
     ax[1, 2].set_xlabel("Iteration")
     ax[1, 2].set_ylabel("rho_cout_nonzero")
     ax[1, 2].set_title("rho_cout_nonzero Progress")
@@ -124,6 +150,8 @@ def progress_plot(
     fig.tight_layout()
 
     fig.savefig(dst_path)
+    plt.close("all")
+
 
 
 def export_submesh(

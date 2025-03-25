@@ -120,7 +120,7 @@ class TopOptimizer():
         rho[prb.design_elements] = np.random.uniform(
             0.3, 0.6, size=len(prb.design_elements)
         )
-        
+        mu = cfg.mu
         compliance_history = list()
         lambda_v_history = list()
         rho_ave_history = list()
@@ -161,59 +161,57 @@ class TopOptimizer():
             )
 
             dc = -cfg.p * (prb.E0 - prb.Emin) * (rho[prb.design_elements] ** (cfg.p - 1)) * strain_energy
-            # dc = dc / (np.abs(dc).max() + 1e-8)
-            # dc = np.clip(dc, -1.0, -1e-3)
-            dc_full = np.zeros_like(rho)
-            dc_full[prb.design_elements] = dc
-            dc_full_filtered = techniques.helmholtz_filter_element_based_tet(
-                dc_full, basis_rho, cfg.dfilter_radius
-            )
-            dc = dc_full_filtered[prb.design_elements]
-            # dc = np.clip(dc, -1.0, -1e-2)
-            # dc = np.clip(dc, -1.0, -1e-4)
-            dc = dc / (np.max(np.abs(dc)) + 1e-8)
-
-
-
-            
-            # 
-            # Correction with Lagrange multipliers Bisection Method
-            # 
             rho_e = rho[prb.design_elements]
-            vol_frac = cfg.vol_frac
-            eta = cfg.eta
-            rho_min = cfg.rho_min
-            rho_max = 1.0
-            move_limit = cfg.move_limit
-            tolerance = 1e-4
+            vol_error = np.mean(rho_e) - cfg.vol_frac
+            lambda_v += mu * vol_error
+            lambda_v = np.clip(lambda_v, 1e-6, 1e3)
+            if np.abs(vol_error) > 1e-3:
+                mu *= 1.05
+            else:
+                mu *= 0.95
+
+            print(f"mu: {mu:0.4f}")
             
-            eps = 1e-6
-            l1 = 1e-2
-            l2 = 1e2
-
-            while (l2 - l1) / (0.5 * (l1 + l2) + eps) > tolerance:
-                lmid = 0.5 * (l1 + l2)
-                scaling_factor = (-dc / (lmid + eps)) ** eta
-                # scaling_factor = np.clip(scaling_factor, 0.5, 1.5)
-                scaling_factor = np.clip(scaling_factor, 0.1, 3.0)
-
-                rho_candidate = np.clip(
-                    rho_e * scaling_factor,
-                    np.maximum(rho_e - move_limit, rho_min),
-                    np.minimum(rho_e + move_limit, rho_max)
-                )
-
-                vol_error = np.mean(rho_candidate) - vol_frac
-                # vol_error = np.mean(rho_filtered[cfg.design_elements]) - vol_frac
-                if vol_error > 0:
-                    l1 = lmid
-                else:
-                    l2 = lmid
+            # lambda_v = np.clip(lambda_v, 1e-6, 1e3)
+            lambda_v_history.append(lambda_v)
+            
+            # dc += lambda_v + mu * vol_error
+            # dc = np.clip(dc, -1e3, -1e-6)  # enforce negative
+            
+            
+            # dc += lambda_v + mu * vol_error
+            penalty = lambda_v + mu * vol_error
+            dc += penalty
+            # dc = np.clip(dc, -1e3, -1e-6)
+            dc = dc / (np.abs(dc).max() + 1e-8)
 
 
-            print(f"l1:{l1:0.4f}, l2:{l2:0.4f}, lmid:{lmid:0.4f}, vol_error:{vol_error:0.4f}")
-            lambda_v = lmid
-            lambda_v_history.append(lmid)
+            
+            # 
+            # filter
+            # 
+            # dc_full = np.zeros_like(rho)
+            # dc_full[prb.design_elements] = dc
+            # dc_full_filtered = techniques.helmholtz_filter_element_based_tet(
+            #     dc_full, basis_rho, cfg.dfilter_radius
+            # )
+            # dc = dc_full_filtered[prb.design_elements]
+            # dc = dc / (np.max(np.abs(dc)) + 1e-8)
+
+            if True:
+                safe_dc = np.clip(dc, -1e3, -1e-6)
+                log_dc = np.log(-safe_dc)
+                log_dc -= np.max(log_dc)
+                scaling_factor = np.exp(cfg.eta * log_dc)
+                scaling_factor = np.clip(scaling_factor, 0.5, 1.5)
+            else:
+                scaling_factor = (-dc / (np.abs(dc).max() + 1e-8)) ** cfg.eta
+            rho_candidate = np.clip(
+                rho_e * scaling_factor,
+                np.maximum(rho_e - cfg.move_limit, cfg.rho_min),
+                np.minimum(rho_e + cfg.move_limit, cfg.rho_max)
+            )
+            
             
             # 
             # adjacency_matrix = test.build_element_adjacency_matrix(prb.basis.mesh)
@@ -231,15 +229,11 @@ class TopOptimizer():
             # rho_filtered = techniques.apply_density_filter_cKDTree(
             #     rho, prb.mesh, prb.design_elements, radius=cfg.dfilter_radius
             # )
-            rho_filtered = techniques.helmholtz_filter_element_based_tet(
-                rho, basis_rho, cfg.dfilter_radius
-            )
-            # for _ in range(2):
-            #     rho_filtered = techniques.helmholtz_filter_element_based_tet(
-            #         rho_filtered, basis_rho, cfg.dfilter_radius
-            #     )
+            # rho_filtered = techniques.helmholtz_filter_element_based_tet(
+            #     rho, basis_rho, cfg.dfilter_radius
+            # )
 
-            rho[prb.design_elements] = rho_filtered[prb.design_elements]
+            # rho[prb.design_elements] = rho_filtered[prb.design_elements]
             rho[prb.fixed_elements_in_rho] = 1.0
             
             vol_frac_current = np.mean(rho[prb.design_elements])
