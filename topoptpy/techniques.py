@@ -24,55 +24,55 @@ from skfem.assembly import BilinearForm
 
 from numba import njit
 
+import numpy as np
+from skfem import BilinearForm, asm, Basis
+from skfem.helpers import sym_grad, ddot, trace
 
-def get_stifness(
-    E0: float,
-    Emin: float,
-    nu0: float,
-    p,
-    rho: np.ndarray,
-    opt_target_indices: np.ndarray
-) -> Callable:
 
+def assemble_stiffness_matrix(basis: Basis, rho: np.ndarray, E0: float, Emin: float, p: float, nu: float):
+    """
+    Assemble the global stiffness matrix for 3D linear elasticity with SIMP material interpolation.
+    
+    Parameters:
+        basis : skfem Basis for the mesh (built with ElementVector(ElementTetP1) on MeshTet).
+        rho   : 1D array of length n_elements with density values for each element.
+        E0    : Young's modulus of solid material (for rho = 1).
+        Emin  : Minimum Young's modulus for void material (for rho = 0, ensures numerical stability).
+        p     : Penalization power for SIMP (typically >= 1, e.g., 3 for standard topology optimization).
+        nu    : Poisson's ratio (assumed constant for all elements).
+    
+    Returns:
+        Sparse stiffness matrix (scipy.sparse.csr_matrix) assembled for the given density distribution.
+    """
+    # 1. Compute Young's modulus for each element using SIMP
+    E_elem = Emin + (E0 - Emin) * (rho ** p)  # array of size [n_elements]
+    
+    # 2. Compute Lamé parameters for each element
+    lam = (nu * E_elem) / ((1.0 + nu) * (1.0 - 2.0 * nu))   # first Lamé parameter λ_e per element
+    mu  = E_elem / (2.0 * (1.0 + nu))                      # second Lamé parameter (shear modulus) μ_e per element
+    
+    # Reshape to allow broadcasting over integration points (each as [n_elem, 1] column vectors)
+    lam = lam.reshape(-1, 1)
+    mu  = mu.reshape(-1, 1)
+    
+    # 3. Define the bilinear form for elasticity (integrand of stiffness entries)
     @BilinearForm
-    def stiffness(u, v, w):
-        """build stiffness matrix with 3D/SIMP/Voigt representation"""
+    def stiffness_form(u, v, w):
+        # sym_grad(u) is the strain tensor ε(u) at integration points
+        # trace(sym_grad(u)) is the volumetric strain (divergence of u)
+        # ddot(A, B) computes the double-dot (Frobenius) product of two matrices A and B
+        strain_u = sym_grad(u)
+        strain_v = sym_grad(v)
+        # Apply Lamé parameters for each element (w corresponds to integration context)
+        # lam and mu are arrays of shape [n_elem, 1], broadcasting to [n_elem, n_quad] with strain arrays
+        term_volumetric = lam * trace(strain_u) * trace(strain_v)      # λ * tr(ε(u)) * tr(ε(v))
+        term_dev = 2.0 * mu * ddot(strain_u, strain_v)                 # 2μ * (ε(u) : ε(v))
+        return term_volumetric + term_dev  # integrand for stiffness
+    
+    # 4. Assemble the stiffness matrix using the basis
+    K = asm(stiffness_form, basis)
+    return K
 
-        E = np.full(len(w.idx), E0, dtype=np.float64)
-        nu = np.full(len(w.idx), nu0, dtype=np.float64)
-        target_indices = np.searchsorted(opt_target_indices, w.idx)
-        mask = np.isin(w.idx, opt_target_indices)
-        rho_map = np.ones(len(w.idx))
-        rho_map[mask] = rho[target_indices[mask]]
-        E[mask] = Emin + (E0 - Emin) * rho_map[mask]**p
-        lam = E * nu / ((1 + nu) * (1 - 2 * nu))
-        mu = E / (2 * (1 + nu))
-
-        C = np.zeros((6, 6, len(w.idx)), dtype=np.float64)
-        C[0, 0] = C[1, 1] = C[2, 2] = lam + 2 * mu
-        C[0, 1] = C[0, 2] = C[1, 0] = C[1, 2] = C[2, 0] = C[2, 1] = lam
-        C[3, 3] = C[4, 4] = C[5, 5] = mu
-
-        # Voigt Transform
-        def voigt_map(u):
-            g = u.grad  # shape: (3, 3, npts, nshp)
-            return np.stack([
-                g[0, 0, :, :],          # ε_xx
-                g[1, 1, :, :],          # ε_yy
-                g[2, 2, :, :],          # ε_zz
-                g[1, 2, :, :] + g[2, 1, :, :],  # 2*ε_yz
-                g[2, 0, :, :] + g[0, 2, :, :],  # 2*ε_zx
-                g[0, 1, :, :] + g[1, 0, :, :],  # 2*ε_xy
-            ]) * 0.5
-
-        eps_u = voigt_map(u)
-        eps_v = voigt_map(v)
-        # Stress C : ε
-        sigma = np.einsum("ijm,jmn->imn", C, eps_u)  # shape: (6, npts, nshp)
-
-        return ddot(sigma, eps_v)
-
-    return stiffness
 
 
 def apply_density_filter(
@@ -229,3 +229,35 @@ def extract_local_K(K_data, K_rows, K_cols, dofs):
                     Ke[i, j] = K_data[k]
                     break
     return Ke
+
+
+if __name__ == '__main__':
+    
+    from topoptpy import problem
+
+    prb = problem.toy2()
+    rho = np.ones(prb.all_elements.shape)
+
+    K1 = assemble_stiffness_matrix(
+            prb.basis, rho, prb.E0, 0.0, 1.0, prb.nu0
+    )
+    
+    lam, mu = lame_parameters(prb.E0, prb.nu0)
+    def C(T):
+        return 2. * mu * T + lam * eye(trace(T), T.shape[0])
+
+    @skfem.BilinearForm
+    def stiffness(u, v, w):
+        return ddot(C(sym_grad(u)), sym_grad(v))
+
+    _F = prb.F
+    K2 = stiffness.assemble(prb.basis)
+    
+    K1_e, F1_e = skfem.enforce(K1, _F, D=prb.dirichlet_nodes)
+    K2_e, F2_e = skfem.enforce(K2, _F, D=prb.dirichlet_nodes)
+
+    U1_e = scipy.sparse.linalg.spsolve(K1_e, F1_e)
+    U2_e = scipy.sparse.linalg.spsolve(K2_e, F2_e)
+
+    print("U1_e:", np.average(U1_e))
+    print("U1_e:", np.average(U2_e))
