@@ -29,7 +29,11 @@ from skfem import BilinearForm, asm, Basis
 from skfem.helpers import sym_grad, ddot, trace
 
 
-def assemble_stiffness_matrix(basis: Basis, rho: np.ndarray, E0: float, Emin: float, p: float, nu: float):
+def assemble_stiffness_matrix(
+    basis: Basis,
+    rho: np.ndarray,
+    E0: float, Emin: float, p: float, nu: float
+):
     """
     Assemble the global stiffness matrix for 3D linear elasticity with SIMP material interpolation.
     
@@ -216,6 +220,7 @@ def compute_strain_energy_2(u, K_data, K_rows, K_cols, element_dofs):
         energy[j] = ue @ Ke @ ue
     return energy
 
+
 @njit
 def extract_local_K(K_data, K_rows, K_cols, dofs):
     n = len(dofs)
@@ -239,7 +244,7 @@ if __name__ == '__main__':
     rho = np.ones(prb.all_elements.shape)
 
     K1 = assemble_stiffness_matrix(
-            prb.basis, rho, prb.E0, 0.0, 1.0, prb.nu0
+        prb.basis, rho, prb.E0, 0.0, 1.0, prb.nu0
     )
     
     lam, mu = lame_parameters(prb.E0, prb.nu0)
@@ -261,3 +266,9 @@ if __name__ == '__main__':
 
     print("U1_e:", np.average(U1_e))
     print("U1_e:", np.average(U2_e))
+    
+    sf = 1.0
+    m1 = prb.mesh.translated(sf * U1_e[prb.basis.nodal_dofs])
+    m1.save('K1.vtk')
+    m2 = prb.mesh.translated(sf * U2_e[prb.basis.nodal_dofs])
+    m2.save('K2.vtk')

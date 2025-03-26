@@ -3,7 +3,6 @@ import shutil
 import json
 from dataclasses import dataclass, asdict
 import numpy as np
-import scipy
 import scipy.sparse.linalg as spla
 import skfem
 import meshio
@@ -98,28 +97,35 @@ class TopOptimizer():
         e_rho = skfem.ElementTetP1()
         basis_rho = skfem.Basis(prb.mesh, e_rho)
         
-        K = techniques.assemble_stiffness_matrix(
-            prb.basis, rho, prb.E0,
-            prb.Emin, cfg.p, prb.nu0
+        K = skfem.asm(
+            techniques.get_stifness(
+                prb.E0, prb.Emin, prb.nu0, cfg.p,
+                rho,
+                prb.design_elements
+            ),
+            prb.basis
         )
 
-        K_e, F_e = skfem.enforce(K, prb.F, D=prb.dirichlet_nodes)
-        u = scipy.sparse.linalg.spsolve(K_e, F_e)
+        K_free = K[prb.free_nodes][:, prb.free_nodes]
         f_free = prb.F[prb.free_nodes]
+
+        # Solve Displacement
+        u = np.zeros(K.shape[0])
+        u[prb.free_nodes] = spla.spsolve(K_free, f_free)
 
         # Compliance
         compliance = f_free @ u[prb.free_nodes]
         print(f"compliance: {compliance}")
         
-        rho[prb.design_elements] = np.random.uniform(
-            0.3, 0.6, size=len(prb.design_elements)
-        )
-        mu = cfg.mu
+        # rho[prb.design_elements] = np.random.uniform(
+        #     0.3, 0.6, size=len(prb.design_elements)
+        # )
+        
         compliance_history = list()
         lambda_v_history = list()
         rho_ave_history = list()
         rho_std_history = list()
-        rho_nonzero_cout = list()
+        rho_noncout_zero = list()
         rho_diff_history = list()
         dc_ave_history = list()
         lambda_v = cfg.lambda_v
@@ -129,14 +135,21 @@ class TopOptimizer():
             
             # build stiffnes matrix
             print(f"prb.E0, prb.Emin, prb.nu0, {cfg.p}: {prb.E0:0.4f}, {prb.Emin:0.4f}, {prb.nu0:0.4f}, {cfg.p:0.4f}")
-            K = techniques.assemble_stiffness_matrix(
-                prb.basis, rho, prb.E0,
-                prb.Emin, cfg.p, prb.nu0
+            K = skfem.asm(
+                techniques.get_stifness(
+                    prb.E0, prb.Emin, prb.nu0, cfg.p,
+                    rho,
+                    prb.design_elements
+                ),
+                prb.basis
             )
-            
-            K_e, F_e = skfem.enforce(K, prb.F, D=prb.dirichlet_nodes)
-            u = scipy.sparse.linalg.spsolve(K_e, F_e)
+
+            K_free = K[prb.free_nodes][:, prb.free_nodes]
             f_free = prb.F[prb.free_nodes]
+
+            # Solve Displacement
+            u = np.zeros(K.shape[0])
+            u[prb.free_nodes] = spla.spsolve(K_free, f_free)
 
             # Compliance
             compliance = f_free @ u[prb.free_nodes]
@@ -148,65 +161,61 @@ class TopOptimizer():
             )
 
             dc = -cfg.p * (prb.E0 - prb.Emin) * (rho[prb.design_elements] ** (cfg.p - 1)) * strain_energy
-            rho_e = rho[prb.design_elements]
-            vol_error = np.mean(rho_e) - cfg.vol_frac
-            lambda_v += mu * vol_error
-            lambda_v = np.clip(lambda_v, 1e-6, 1e3)
-            if np.abs(vol_error) > 1e-3:
-                mu *= 1.05
-            else:
-                mu *= 0.95
-
-            print(f"mu: {mu:0.4f}")
-            
-            # lambda_v = np.clip(lambda_v, 1e-6, 1e3)
-            lambda_v_history.append(lambda_v)
-            
-            # dc += lambda_v + mu * vol_error
-            # dc = np.clip(dc, -1e3, -1e-6)  # enforce negative
-            
-            
-            # dc += lambda_v + mu * vol_error
-            penalty = lambda_v + mu * vol_error
-            dc += penalty
-            # dc = np.clip(dc, -1e3, -1e-6)
-            dc = dc / (np.abs(dc).max() + 1e-8)
-
-
-            
-            # 
-            # filter
-            # 
-            # dc_full = np.zeros_like(rho)
-            # dc_full[prb.design_elements] = dc
-            # dc_full_filtered = techniques.helmholtz_filter_element_based_tet(
-            #     dc_full, basis_rho, cfg.dfilter_radius
-            # )
-            # dc = dc_full_filtered[prb.design_elements]
-            # dc = dc / (np.max(np.abs(dc)) + 1e-8)
-
-            if True:
-                safe_dc = np.clip(dc, -1e3, -1e-6)
-                log_dc = np.log(-safe_dc)
-                log_dc -= np.max(log_dc)
-                scaling_factor = np.exp(cfg.eta * log_dc)
-                scaling_factor = np.clip(scaling_factor, 0.5, 1.5)
-            else:
-                scaling_factor = (-dc / (np.abs(dc).max() + 1e-8)) ** cfg.eta
-            rho_candidate = np.clip(
-                rho_e * scaling_factor,
-                np.maximum(rho_e - cfg.move_limit, cfg.rho_min),
-                np.minimum(rho_e + cfg.move_limit, cfg.rho_max)
+            # dc = dc / (np.abs(dc).max() + 1e-8)
+            # dc = np.clip(dc, -1.0, -1e-3)
+            dc_full = np.zeros_like(rho)
+            dc_full[prb.design_elements] = dc
+            dc_full_filtered = techniques.helmholtz_filter_element_based_tet(
+                dc_full, basis_rho, cfg.dfilter_radius
             )
-            
+            dc = dc_full[prb.design_elements]
+            dc = np.clip(dc, -1.0, -1e-2)
+
             
             # 
-            # adjacency_matrix = test.build_element_adjacency_matrix(prb.basis.mesh)
-            # rho_full = np.full(adjacency_matrix.shape[0], cfg.rho_min)
-            # rho_full[prb.design_elements] = rho_candidate
-            # mask_full = test.extract_main_component(rho_full, adjacency_matrix, threshold=0.3)
-            # mask_candidate = mask_full[prb.design_elements]
-            # rho_candidate[~mask_candidate] = cfg.rho_min
+            # Correction with Lagrange multipliers Bisection Method
+            # 
+            rho_e = rho[prb.design_elements]
+            vol_frac = cfg.vol_frac
+            eta = cfg.eta
+            rho_min = cfg.rho_min
+            rho_max = 1.0
+            move_limit = cfg.move_limit
+            tolerance = 1e-4
+            
+            eps = 1e-6
+            l1 = 1e-3
+            l2 = 1e3
+
+            while (l2 - l1) / (0.5 * (l1 + l2) + eps) > tolerance:
+                lmid = 0.5 * (l1 + l2)
+                scaling_factor = (-dc / (lmid + eps)) ** eta
+                # scaling_factor = np.clip(scaling_factor, 0.5, 1.5)
+                
+                rho_candidate = np.clip(
+                    rho_e * scaling_factor,
+                    np.maximum(rho_e - move_limit, rho_min),
+                    np.minimum(rho_e + move_limit, rho_max)
+                )
+
+                vol_error = np.mean(rho_candidate) - vol_frac
+                if vol_error > 0:
+                    l1 = lmid
+                else:
+                    l2 = lmid
+
+
+            print(f"l1:{l1:0.4f}, l2:{l2:0.4f}, lmid:{lmid:0.4f}, vol_error:{vol_error:0.4f}")
+            lambda_v = lmid
+            lambda_v_history.append(lmid)
+            
+            # 
+            adjacency_matrix = test.build_element_adjacency_matrix(prb.basis.mesh)
+            rho_full = np.full(adjacency_matrix.shape[0], cfg.rho_min)
+            rho_full[prb.design_elements] = rho_candidate
+            mask_full = test.extract_main_component(rho_full, adjacency_matrix, threshold=0.3)
+            mask_candidate = mask_full[prb.design_elements]
+            rho_candidate[~mask_candidate] = cfg.rho_min
             
             # 
             # 
@@ -216,11 +225,16 @@ class TopOptimizer():
             # rho_filtered = techniques.apply_density_filter_cKDTree(
             #     rho, prb.mesh, prb.design_elements, radius=cfg.dfilter_radius
             # )
-            # rho_filtered = techniques.helmholtz_filter_element_based_tet(
-            #     rho, basis_rho, cfg.dfilter_radius
-            # )
+            rho_filtered = techniques.helmholtz_filter_element_based_tet(
+                rho, basis_rho, cfg.dfilter_radius
+            )
+            # for _ in range(2):
+            #     rho_filtered = techniques.helmholtz_filter_element_based_tet(
+            #         rho_filtered, basis_rho, cfg.dfilter_radius
+            #     )
 
-            # rho[prb.design_elements] = rho_filtered[prb.design_elements]
+            
+            rho[prb.design_elements] = rho_filtered[prb.design_elements]
             rho[prb.fixed_elements_in_rho] = 1.0
             
             vol_frac_current = np.mean(rho[prb.design_elements])
@@ -233,7 +247,7 @@ class TopOptimizer():
             rho_diff_history.append(np.mean(rho_diff[prb.design_elements]))
             rho_ave_history.append(np.average(rho[prb.design_elements]))
             rho_std_history.append(np.std(rho[prb.design_elements]))
-            rho_nonzero_cout.append(np.count_nonzero(rho[prb.design_elements] > cfg.rho_min * 3.0))
+            rho_noncout_zero.append(np.count_nonzero(rho[prb.design_elements] > cfg.rho_min * 10.0))
             rho_frac = int(len(rho[prb.design_elements]) * cfg.vol_frac)
 
             print(f"lambda_v: {lambda_v:.4f}, vol_error: {vol_error:.4f}, rho_ave: {rho_ave_history[-1]:.4f}")
@@ -246,15 +260,15 @@ class TopOptimizer():
             print(f"compliance_history: {compliance_history[-1]}")
             print(f"rho_ave: {rho_ave_history[-1]} - target: {cfg.vol_frac}")
             print(f"rho_std: {rho_std_history[-1]}")
-            print(f"rho_candidate min/max: {rho_candidate.min():.4f} / {rho_candidate.max():.4f}")
             print(
-                f"rho_nonzero_cout: {rho_nonzero_cout[-1]} / {len(rho[prb.design_elements])},\
+                f"rho_noncout_zero: {rho_noncout_zero[-1]} / {len(rho[prb.design_elements])},\
                 th: {rho_frac}"
             )
             
+
             
-            if iter % (cfg.num_iter // self.record_times) == 0 or iter == 1:
-            # if True:
+            # if iter % (cfg.num_iter // self.record_times) == 0 or iter == 1:
+            if True:
                 print(f"Saving at iteration {iter}")
                 self.export_mesh(rho, str(iter))
                 self.export_mesh_org(
@@ -262,24 +276,24 @@ class TopOptimizer():
                     "dp",
                     f"{self.dst_path}/rho-histo/dp-{str(iter)}.vtu"
                 )
-                
+                utils.progress_plot(
+                    compliance_history,
+                    rho_diff_history,
+                    lambda_v_history,
+                    dc_ave_history,
+                    rho_ave_history, cfg.vol_frac,
+                    rho_std_history,
+                    rho_noncout_zero, rho_frac,
+                    f"{self.dst_path}/progress.jpg"
+                )
                 utils.rho_histo_plot(
                     rho[prb.design_elements],
                     f"{self.dst_path}/rho-histo/{str(iter)}.jpg"
                 )
-            utils.progress_plot(
-                compliance_history,
-                rho_diff_history,
-                lambda_v_history,
-                dc_ave_history,
-                rho_ave_history, cfg.vol_frac,
-                rho_std_history,
-                rho_nonzero_cout, rho_frac,
-                f"{self.dst_path}/progress.jpg"
-            )
 
             if len(rho_diff_history) > 10 and rho_diff_history[-1] < 1e-8:
                 break
+
 
         utils.progress_plot(
             compliance_history,
@@ -288,7 +302,7 @@ class TopOptimizer():
             dc_ave_history,
             rho_ave_history, cfg.vol_frac,
             rho_std_history,
-            rho_nonzero_cout, rho_frac,
+            rho_noncout_zero, rho_frac,
             f"{self.dst_path}/progress.jpg"
         )
         utils.rho_histo_plot(
@@ -304,6 +318,121 @@ class TopOptimizer():
         self.export_mesh(rho, "last")
     
     
+    def run_gd(
+        self
+    ):
+        prb = self.prb
+        cfg = self.cfg
+        rho = np.ones(prb.all_elements.shape)
+        rho[prb.design_elements] = np.random.uniform(
+            0.3, 0.6, size=len(prb.design_elements)
+        )
+        
+        compliance_history = list()
+        # rho_history = list()
+        lambda_v_history = list()
+        rho_ave_history = list()
+        rho_std_history = list()
+        rho_noncout_zero = list()
+        dC_drho_ave_history = list()
+        lambda_v = cfg.lambda_v
+        for iter in range(1, cfg.num_iter+1):
+            print(f"iterations: {iter} / {cfg.num_iter}")
+            
+            # build stiffnes matrix
+            K = skfem.asm(
+                techniques.get_stifness(
+                    prb.E0, prb.Emin, prb.nu0, cfg.p,
+                    rho,
+                    prb.design_elements
+                ),
+                prb.basis
+            )
+
+            K_free = K[prb.free_nodes][:, prb.free_nodes]
+            f_free = prb.F[prb.free_nodes]
+
+            # Solve Displacement
+            u = np.zeros(K.shape[0])
+            u[prb.free_nodes] = spla.spsolve(K_free, f_free)
+
+            # Compliance
+            compliance = f_free @ u[prb.free_nodes]
+            compliance_history.append(compliance)
+
+            # Compute strain energy and obtain derivatives
+            strain_energy = techniques.compute_strain_energy_1(
+                u, K.toarray(), prb.basis.element_dofs[:, prb.design_elements]
+            )
+            dC_drho = -cfg.p * (prb.E0 - prb.Emin) * (rho[prb.design_elements] ** (cfg.p - 1)) * strain_energy
+            vol_error = np.mean(rho[prb.design_elements]) - cfg.vol_frac
+            dC_drho += (lambda_v + cfg.mu * vol_error) / len(prb.design_elements)
+            lambda_v += cfg.mu * vol_error
+            dC_drho += cfg.alpha
+            
+            # Update Density
+            rho[prb.design_elements] -= cfg.learning_rate * dC_drho
+            rho[prb.fixed_elements_in_rho] = 1
+            rho = techniques.apply_density_filter_cKDTree(
+                rho, prb.mesh, prb.design_elements, radius=cfg.dfilter_radius
+            )
+            rho[prb.design_elements] = np.clip(rho[prb.design_elements], 0.01, 1.0)
+            
+            lambda_v_history.append(lambda_v)
+            dC_drho_ave_history.append(np.average(dC_drho))
+            rho_ave_history.append(np.average(rho[prb.design_elements]))
+            rho_std_history.append(np.std(rho[prb.design_elements]))
+            rho_noncout_zero.append(np.count_nonzero(rho[prb.design_elements] <= 0.02)) 
+
+            
+            print(f"rho: {rho}")
+            print(f"compliance_history: {compliance_history[-1]}")
+            print(f"rho_ave: {rho_ave_history[-1]} - target: {cfg.vol_frac}")
+            print(f"rho_std: {rho_std_history[-1]}")
+            print(
+                f"rho_noncout_zero: {rho_noncout_zero[-1]} / {len(rho[prb.design_elements])},\
+                th: {len(rho[prb.design_elements]) * cfg.vol_frac}"
+            )
+            
+            if iter % (cfg.num_iter // self.record_times) == 0:
+            # if True:
+                print(f"Saving at iteration {iter}")
+                self.export_mesh(rho, str(iter))
+                
+                utils.progress_plot(
+                    compliance_history,
+                    dC_drho_ave_history,
+                    lambda_v_history,
+                    rho_ave_history,
+                    rho_std_history,
+                    rho_noncout_zero,
+                    f"{self.dst_path}/progress.jpg"
+                )
+                
+
+            if rho_noncout_zero[-1] > len(rho[prb.design_elements]) * cfg.vol_frac * 0.95:
+                break
+            # break
+
+
+        utils.progress_plot(
+            compliance_history,
+            dC_drho_ave_history,
+            lambda_v_history,
+            rho_ave_history,
+            rho_std_history,
+            rho_noncout_zero,
+            f"{self.dst_path}/progress.jpg"
+        )
+
+        threshold = 0.05
+        remove_elements = prb.design_elements[rho[prb.design_elements] <= threshold]
+        kept_elements = np.setdiff1d(prb.all_elements, remove_elements)
+        utils.export_submesh(prb.mesh, kept_elements, f"{self.dst_path}/cubic_top.vtk")
+
+        self.export_mesh(rho, "last")
+        
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(

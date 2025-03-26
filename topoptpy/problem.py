@@ -227,7 +227,7 @@ def toy2():
     # E0 = 2.0e9
     E0 = 1.0
     # F = -1000.0
-    F = -1.0
+    F = -0.3
     return SIMPProblem.from_defaults(
         E0,
         0.30,
