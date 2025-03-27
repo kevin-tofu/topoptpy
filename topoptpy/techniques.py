@@ -29,10 +29,32 @@ from skfem import BilinearForm, asm, Basis
 from skfem.helpers import sym_grad, ddot, trace
 
 
+def simp_interpolation(rho, E0, Emin, p):
+    E_elem = Emin + (E0 - Emin) * (rho ** p)
+    return E_elem
+
+
+def ramp_interpolation(rho, E0, Emin, p):
+    """
+    RAMP: E(rho) = Emin + (E0 - Emin) * [rho / (1 + p(1 - rho))]
+    Parameters:
+      rho  : array of densities in [0,1]
+      E0   : maximum Young's modulus
+      Emin : minimum Young's modulus
+      p    : RAMP parameter
+    Returns:
+      array of element-wise Young's moduli
+    """
+    # avoid division by zero
+    E_elem = Emin + (E0 - Emin) * (rho / (1.0 + p*(1.0 - rho)))
+    return E_elem
+
+
 def assemble_stiffness_matrix(
     basis: Basis,
     rho: np.ndarray,
-    E0: float, Emin: float, p: float, nu: float
+    E0: float, Emin: float, p: float, nu: float,
+    elem_func: Callable=simp_interpolation
 ):
     """
     Assemble the global stiffness matrix for 3D linear elasticity with SIMP material interpolation.
@@ -49,7 +71,7 @@ def assemble_stiffness_matrix(
         Sparse stiffness matrix (scipy.sparse.csr_matrix) assembled for the given density distribution.
     """
     # 1. Compute Young's modulus for each element using SIMP
-    E_elem = Emin + (E0 - Emin) * (rho ** p)  # array of size [n_elements]
+    E_elem = elem_func(rho, E0, Emin, p)  # array of size [n_elements]
     
     # 2. Compute Lamé parameters for each element
     lam = (nu * E_elem) / ((1.0 + nu) * (1.0 - 2.0 * nu))   # first Lamé parameter λ_e per element
@@ -77,6 +99,40 @@ def assemble_stiffness_matrix(
     K = asm(stiffness_form, basis)
     return K
 
+
+def assemble_stiffness_matrix_simp(
+    basis: Basis,
+    rho: np.ndarray,
+    E0: float, Emin: float, p: float, nu: float
+):
+    return assemble_stiffness_matrix(
+        basis,
+        rho,
+        E0, Emin, p, nu,
+        elem_func=simp_interpolation
+    )
+
+def assemble_stiffness_matrix_ramp(
+    basis: Basis,
+    rho: np.ndarray,
+    E0: float, Emin: float, p: float, nu: float
+):
+    return assemble_stiffness_matrix(
+        basis,
+        rho,
+        E0, Emin, p, nu,
+        elem_func=ramp_interpolation
+    )
+
+
+def dEdRho_simp(rho, E0, Emin, p):
+    denom = (1 + p * (1 - rho))
+    return (E0 - Emin) * (denom - p * rho) / (denom ** 2)
+
+
+def dEdRho_ramp(rho, E0, Emin, p):
+    denom = (1 + p * (1 - rho))
+    return (E0 - Emin) * (denom - p * rho) / (denom ** 2)
 
 
 def apply_density_filter(

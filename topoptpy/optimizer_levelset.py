@@ -18,28 +18,18 @@ from topoptpy.history import HistoryLogger
 
 
 def initialize_phi_as_sphere(mesh, radius=0.3):
+    """
+    球の内部 -> φ > 0, 外部 -> φ < 0
+    """
     center = mesh.p.mean(axis=1)
     dist = np.linalg.norm(mesh.p.T - center, axis=1)
-    return dist - radius
+    return radius - dist  # dist < radius のとき φ>0
 
 
 def create_phi_from_mesh_3d(mesh, solid_mask, res=64):
     """
-    Create 3D level set φ from a scikit-fem 3D mesh and a solid mask.
-
-    Parameters
-    ----------
-    mesh : skfem.Mesh
-        A 3D scikit-fem mesh (e.g., MeshTet).
-    solid_mask : np.ndarray
-        Binary array of shape (mesh.p.shape[1],) where 1 = solid, 0 = void.
-    res : int
-        Resolution of the 3D grid for distance transform.
-
-    Returns
-    -------
-    phi : np.ndarray
-        φ at each mesh node.
+    Create 3D level set φ from a scikit-fem 3D mesh and a solid_mask
+    such that solid_mask==1 -> φ>0 (inside), solid_mask==0 -> φ<0 (outside).
     """
     coords = mesh.p.T  # shape (n_nodes, 3)
     xmin, ymin, zmin = coords.min(axis=0)
@@ -51,55 +41,82 @@ def create_phi_from_mesh_3d(mesh, solid_mask, res=64):
     xv, yv, zv = np.meshgrid(x_grid, y_grid, z_grid, indexing='ij')
     grid_points = np.stack([xv.ravel(), yv.ravel(), zv.ravel()], axis=1)
 
+    # solid_mask == 1 の座標点をKD-tree化
     solid_points = coords[solid_mask.astype(bool)]
+    if len(solid_points) == 0:
+        # 万が一、材料点が無かったら φを全部負の大きな値にする等
+        # return -1e3 * np.ones_like(coords[:, 0])
+        return -1.5 * np.ones(len(coords))  # ?
+
     tree = cKDTree(solid_points)
     dists, _ = tree.query(grid_points, k=1)
-    
+
+    # ボクセルの空間分解能
     voxel_size = max(xmax - xmin, ymax - ymin, zmax - zmin) / res
+    # しきい値は状況に応じて変更する
     solid_region = (dists < voxel_size * 2).astype(np.uint8)
     solid_region = solid_region.reshape((res, res, res))
 
     inside = distance_transform_edt(solid_region)
     outside = distance_transform_edt(1 - solid_region)
-    phi_grid = inside - outside
 
-    interpolator = RegularGridInterpolator(
-        (x_grid, y_grid, z_grid), phi_grid, bounds_error=False, fill_value=None
-    )
+    # inside -> φ>0, outside -> φ<0 を実現したいので「outside - inside」
+    phi_grid = outside - inside
 
+    # FEMノードへ補間
+    interpolator = RegularGridInterpolator((x_grid, y_grid, z_grid), 
+                                           phi_grid,
+                                           bounds_error=False,
+                                           fill_value=None)
     phi = interpolator(coords)
+
+    # 外挿領域のNaN処理
+    phi = np.nan_to_num(phi, nan=0.0)
+
+    # スケーリング (適宜実行)
+    maxabs = np.max(np.abs(phi)) + 1e-8
+    phi = 1.5 * phi / maxabs
+
     return phi
 
 
 def smoothed_heaviside(phi, epsilon=1.0):
+    """
+    φ > epsilon -> 1, φ < -epsilon -> 0,
+    それ以外の -ε < φ < ε では滑らか遷移
+    """
     H = np.zeros_like(phi)
-    idx1 = phi > epsilon
-    idx2 = phi < -epsilon
-    idx3 = ~np.logical_or(idx1, idx2)
+    idx1 = (phi > epsilon)
+    idx2 = (phi < -epsilon)
+    idx3 = ~(idx1 | idx2)
 
     H[idx1] = 1.0
     H[idx2] = 0.0
 
-    # φ ∈ [-ε, ε] の領域にだけ滑らかな変換を適用
+    # -ε <= φ <= ε の部分のみスムーズ
     phi_smooth = np.clip(phi[idx3], -epsilon, epsilon)
-    H[idx3] = 0.5 + phi_smooth/(2*epsilon) + (1/(2*np.pi)) * np.sin(np.pi * phi_smooth / epsilon)
-    # print("H(phi) stats → min:", H.min(), "max:", H.max(), "mean:", H.mean())
+    H[idx3] = (0.5
+               + phi_smooth/(2*epsilon)
+               + (1/(2*np.pi)) * np.sin(np.pi * phi_smooth / epsilon))
     return H
 
 
-def d_smoothed_heaviside(phi, epsilon=1e-3):
+def d_smoothed_heaviside(phi, epsilon=1.0):
+    """
+    d/dφ ( smoothed_heaviside(phi) )
+    """
     dH = np.zeros_like(phi)
     idx = np.abs(phi) <= epsilon
-    dH[idx] = (1 / (2 * epsilon)) * (1 + np.cos(np.pi * phi[idx] / epsilon))
+    dH[idx] = (1.0 / (2.0 * epsilon)) * (1.0 + np.cos(np.pi * phi[idx] / epsilon))
     return dH
 
 
-
 def upwind_gradient_norm(phi, dx, dy, dz):
-    # φ: (nx, ny, nz)
-    grad_norm = np.zeros_like(phi)
-
-    # forward and backword diff (not center)
+    """
+    Engquist-Osher型のUpwind差分による|∇φ|の近似計算
+    phi: 3次元配列
+    """
+    # forward diff と backward diff
     phi_xf = np.roll(phi, -1, axis=0) - phi
     phi_xb = phi - np.roll(phi, 1, axis=0)
     phi_yf = np.roll(phi, -1, axis=1) - phi
@@ -107,7 +124,7 @@ def upwind_gradient_norm(phi, dx, dy, dz):
     phi_zf = np.roll(phi, -1, axis=2) - phi
     phi_zb = phi - np.roll(phi, 1, axis=2)
 
-    #  Engquist–Osher upwind on each direction
+    # EOスキーム
     phi_x_plus = np.maximum(phi_xb, 0)**2
     phi_x_minus = np.minimum(phi_xf, 0)**2
     phi_y_plus = np.maximum(phi_yb, 0)**2
@@ -121,37 +138,15 @@ def upwind_gradient_norm(phi, dx, dy, dz):
         np.maximum(phi_z_plus, phi_z_minus) / dz**2
     )
     return grad_norm
-
-
-def upwind_gradient_norm(phi, dx, dy, dz):
-    phi_xf = np.roll(phi, -1, axis=0) - phi
-    phi_xb = phi - np.roll(phi, 1, axis=0)
-    phi_yf = np.roll(phi, -1, axis=1) - phi
-    phi_yb = phi - np.roll(phi, 1, axis=1)
-    phi_zf = np.roll(phi, -1, axis=2) - phi
-    phi_zb = phi - np.roll(phi, 1, axis=2)
-
-    phi_x_plus = np.maximum(phi_xb, 0)**2
-    phi_x_minus = np.minimum(phi_xf, 0)**2
-    phi_y_plus = np.maximum(phi_yb, 0)**2
-    phi_y_minus = np.minimum(phi_yf, 0)**2
-    phi_z_plus = np.maximum(phi_zb, 0)**2
-    phi_z_minus = np.minimum(phi_zf, 0)**2
-
-    grad_norm = np.sqrt(
-        np.maximum(phi_x_plus, phi_x_minus) / dx**2 +
-        np.maximum(phi_y_plus, phi_y_minus) / dy**2 +
-        np.maximum(phi_z_plus, phi_z_minus) / dz**2
-    )
-    return grad_norm
-
-
-def update_phi_hj(phi, Vn, dx, dy, dz, dt):
-    grad_phi = upwind_gradient_norm(phi, dx, dy, dz)
-    return phi - dt * Vn * grad_phi
 
 
 def update_phi_with_pde(mesh, phi, Vn, grid_resolution=64, dt=1.0, reinit=False):
+    """
+    1. FEMノードの (φ, Vn) を等間隔グリッドへ補間
+    2. HJ式でφを更新
+    3. (必要なら) 再初期化
+    4. グリッド上の新しいφを再びFEMノードへ補間して返す
+    """
     coords = mesh.p.T
     xmin, ymin, zmin = coords.min(axis=0)
     xmax, ymax, zmax = coords.max(axis=0)
@@ -167,60 +162,72 @@ def update_phi_with_pde(mesh, phi, Vn, grid_resolution=64, dt=1.0, reinit=False)
     xv, yv, zv = np.meshgrid(x, y, z, indexing='ij')
     grid_points = np.stack([xv, yv, zv], axis=-1).reshape(-1, 3)
 
-    # 2. φ と dC/dφ を補間
-    phi_interp = LinearNDInterpolator(coords, phi)
-    Vn_interp = LinearNDInterpolator(coords, Vn)
-    # Vn_interp = LinearNDInterpolator(coords, -dC_dphi)
+    # 1. FEMノード -> グリッドへ補間
+    phi_interp = LinearNDInterpolator(coords, phi, fill_value=np.nan)
+    Vn_interp = LinearNDInterpolator(coords, Vn, fill_value=0.0)
 
     phi_grid = phi_interp(grid_points).reshape((nx, ny, nz))
     Vn_grid = Vn_interp(grid_points).reshape((nx, ny, nz))
 
-    # 3. PDE による φ 更新
+    # NaN処理
+    phi_grid = np.nan_to_num(phi_grid, nan=0.0)
+    Vn_grid = np.nan_to_num(Vn_grid, nan=0.0)
+
+    # 2. PDE更新
     phi_grid_new = update_phi_hj(phi_grid, Vn_grid, dx, dy, dz, dt)
 
-    # 4. φ 再初期化（必要なら）
+    # 3. 再初期化
     if reinit:
-        level = 0.0
-        inside = phi_grid >= level
-        outside = phi_grid < level
-        if not np.any(inside) or not np.any(outside):
-            print(
-                "⚠️Skip ReInitialization since the value of φ is completely biased (positive or negative)"
-            )
-            phi_grid_new = phi_grid 
+        # φの正負で inside/outside を判定
+        if np.all(phi_grid_new >= 0.) or np.all(phi_grid_new <= 0.):
+            print("⚠ すべての点が同符号なので reinit をスキップします.")
         else:
-            phi_inside = distance_transform_edt(inside)
-            phi_outside = distance_transform_edt(outside)
-            phi_grid_new = phi_inside - phi_outside
-            # phi_grid_new = np.clip(phi_grid_new, -1.5, 1.5)
-            # phi_grid_new = np.clip(phi_grid_new, -5.0, 5.0)
+            phi_grid_new = reinitialize_phi(phi_grid_new)
 
-    # 5. φ を FEMノードに戻す
-    grid_interp_back = RegularGridInterpolator((x, y, z), phi_grid_new, bounds_error=False, fill_value=None)
+    # 4. グリッド -> FEMノードへ再補間
+    grid_interp_back = RegularGridInterpolator((x, y, z), phi_grid_new,
+                                               bounds_error=False,
+                                               fill_value=None)
     phi_new = grid_interp_back(coords)
-    
-    phi_new /= np.max(np.abs(phi_new)) + 1e-8
-    phi_new *= 1.5  # φ ∈ [-1.5, 1.5]
+
+    # NaN処理
+    phi_new = np.nan_to_num(phi_new, nan=0.0)
+
+    # スケーリング（適宜）
+    maxabs = np.max(np.abs(phi_new)) + 1e-8
+    phi_new = 1.5 * phi_new / maxabs
 
     return phi_new
-
 
 # def update_phi(phi, dC_dphi, step_size=1.0):
 #     return phi - step_size * dC_dphi
 
-
 def update_phi_hj(phi, Vn, dx=1.0, dy=1.0, dz=1.0, dt=1.0):
+    """
+    HJ方程式: φ_t + Vn * |∇φ| = 0
+      -> φ_{n+1} = φ_n - dt * Vn * |∇φ|
+    """
     grad_phi = upwind_gradient_norm(phi, dx, dy, dz)
-    phi_new = phi - dt * Vn * grad_phi
-    return phi_new
+    return phi - dt * Vn * grad_phi
+
 
 
 def reinitialize_phi(phi):
-    inside = phi > 0
-    outside = phi <= 0
-    phi_inside = distance_transform_edt(inside)
-    phi_outside = distance_transform_edt(outside)
-    return phi_inside - phi_outside
+    """
+    現在の φ を基に，φ>0 を inside として EDTで再初期化.
+      inside=0距離 -> 距離_transform=0
+      outside=0距離 -> 距離_transform=0
+    それぞれ計算して inside->正, outside->負 となるよう差をとる
+    """
+    inside_mask = (phi > 0)
+    outside_mask = ~inside_mask
+
+    phi_inside = distance_transform_edt(inside_mask)
+    phi_outside = distance_transform_edt(outside_mask)
+
+    # inside -> φ>0, outside -> φ<0 に合わせるには (out - in)
+    phi_new = phi_outside - phi_inside
+    return phi_new
 
 
 def smoothed_heaviside_derivative(phi, epsilon=1.0):
@@ -230,7 +237,7 @@ def smoothed_heaviside_derivative(phi, epsilon=1.0):
     return dH
 
 
-def save_level_set_isosurface(prb, phi, rho, file_path='levelset.vtk'):
+def save_level_set_isosurface(prb, phi, phi_prev, rho, file_path='levelset.vtk'):
     
     mesh = prb.mesh
     dirichlet_ele = utils.get_elements_with_points(mesh, [prb.dirichlet_points])
@@ -245,7 +252,7 @@ def save_level_set_isosurface(prb, phi, rho, file_path='levelset.vtk'):
     meshio_mesh = meshio.Mesh(
         points=mesh.p.T,
         cells=[("tetra", mesh.t.T)],
-        point_data={"phi": phi},
+        point_data={"phi": phi, "phi-diff": phi - phi_prev},
         cell_data={"density": [rho], "condition": [element_colors_df2]}
     )
     meshio.write(file_path, meshio_mesh)
@@ -352,6 +359,7 @@ class TopOptimizer():
         for iter in range(1, cfg.max_iter+1):
             print(f" --- {iter} / {cfg.max_iter} ---")
             print("φ > 0 割合:", np.mean(phi > 0))
+            phi_prev = phi.copy()
             # phi_e = phi[prb.mesh.elements].mean(axis=0)
             # rho_e = smoothed_heaviside(phi_e, epsilon=1e-2)
             # better in terms of accuracy
@@ -401,12 +409,15 @@ class TopOptimizer():
                     counts[n] += 1
             dC_dphi /= np.maximum(counts, 1)
             
+            
+            lambda_vol = 5.0
             # lambda_vol = 1.0
-            lambda_vol = 0.5
+            # lambda_vol = 0.5
             # lambda_vol = 1e-3
-            dJ_dphi = dC_dphi + lambda_vol * smoothed_heaviside_derivative(
+            p = smoothed_heaviside_derivative(
                 phi, epsilon=0.05
             )
+            dJ_dphi = dC_dphi + lambda_vol * p
             dJ_dphi = dJ_dphi / (np.max(np.abs(dJ_dphi)) + 1e-8)
             
             Vn = - dJ_dphi
@@ -430,7 +441,7 @@ class TopOptimizer():
             print("H'(φ) stats:", dH_stats)
 
             save_level_set_isosurface(
-                prb, phi, rho_at_ip,
+                prb, phi, phi_prev, rho_at_ip,
                 file_path=f'{self.dst_path}/mesh_rho/levelset-{iter}.vtu'
             )
 
@@ -444,6 +455,11 @@ class TopOptimizer():
             phi_history.print()
             rho_history.print()
             compliance_history.print()
+            
+            if np.mean(phi > 0) < 0.3:
+                print("")
+                break
+
 
 if __name__ == '__main__':
     import argparse
