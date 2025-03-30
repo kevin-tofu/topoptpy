@@ -33,6 +33,7 @@ class OCConfig():
     rho_min: float = 1e-3
     rho_max: float = 1.0
     move_limit: float = 0.2
+    move_limit_rate: float = 20.0
     
 
     @classmethod
@@ -114,7 +115,9 @@ def schedule_exp_accelerate(
         return target - (target - start) * (1 - np.exp(rate * (t - 1)))
 
 
-def get_update_params(p_init, vol_frac_init, beta_init):
+def get_update_params(
+    p_init, vol_frac_init, beta_init, move_limit_init
+):
     def update_params(
         cfg, iter: int
     ):
@@ -126,28 +129,34 @@ def get_update_params(p_init, vol_frac_init, beta_init):
         vol_frac_now = schedule_exp_slowdown(
             iter, cfg.max_iters, vol_frac_init, cfg.vol_frac, cfg.vol_frac_rate
         )
-        return p_now, vol_frac_now, beta_now
+        
+        move_limit_now = schedule_exp_slowdown(
+            iter, cfg.max_iters, move_limit_init, cfg.move_limit, cfg.move_limit_rate
+        )
+        return p_now, vol_frac_now, beta_now, move_limit_now
 
     return update_params
     
 
 def plot_schedule(
     cfg,
-    p_init: float, vol_frac_init: float,
+    p_init: float, vol_frac_init: float, beta_init: float, max_limit_init: float,
     dst_path: str
 ):
     import matplotlib.pyplot as plt
-    update_params = get_update_params(p_init, vol_frac_init, cfg.beta / 100.0)
+    update_params = get_update_params(p_init, vol_frac_init, cfg.beta / 100.0, 0.8)
     p_list = list()
     vol_frac_list = list()
     beta_list = list()
+    max_limit_list = list()
     for iter in range(1, cfg.max_iters+1):
-        p, vol_frac, beta = update_params(cfg, iter)
+        p, vol_frac, beta, max_limit  = update_params(cfg, iter)
         p_list.append(p)
         vol_frac_list.append(vol_frac)
         beta_list.append(beta)
+        max_limit_list.append(max_limit)
 
-    fig, ax = plt.subplots(1, 3, figsize=(12, 8))
+    fig, ax = plt.subplots(1, 4, figsize=(12, 8))
     ax[0].plot(p_list, marker='o', linestyle='-')
     ax[0].set_xlabel("Iteration")
     ax[0].set_ylabel("P")
@@ -163,7 +172,11 @@ def plot_schedule(
     ax[2].set_ylabel("beta")
     ax[2].set_title("beta schedule")
     ax[2].grid(True)
-
+    ax[3].plot(max_limit_list, marker='o', linestyle='-')
+    ax[3].set_xlabel("Iteration")
+    ax[3].set_ylabel("max_limit")
+    ax[3].set_title("max_limit schedule")
+    ax[3].grid(True)
     fig.tight_layout()
     fig.savefig(dst_path)
     plt.close("all")
@@ -204,7 +217,7 @@ class TopOptimizer():
         self.recorder_params.add("p")
         self.recorder_params.add("vol_frac")
         self.recorder_params.add("beta")
-        
+        self.recorder_params.add("move_limit")
 
 
     def run(
@@ -220,7 +233,8 @@ class TopOptimizer():
             0.5, 0.8, size=len(prb.design_elements)
         )
         plot_schedule(
-            cfg, 1.0, np.mean(rho[prb.design_elements]),
+            cfg, 1.0,
+            np.mean(rho[prb.design_elements]),
             f"{self.cfg.dst_path}/schedule.jpg"
         )
         update_params = get_update_params(1.0, np.mean(rho[prb.design_elements]))
@@ -325,6 +339,7 @@ class TopOptimizer():
             
             
             
+            
             #     noise_strength = 0.03
             #     # rho[prb.design_elements] += np.random.uniform(
             #     #     -noise_strength, noise_strength, size=prb.design_elements.shape
@@ -386,13 +401,18 @@ class TopOptimizer():
         )
         plot_schedule(
             cfg,
-            1.0, np.mean(rho[prb.design_elements]), 
+            1.0, np.mean(rho[prb.design_elements]),
+            cfg.beta / 10.0,
+            0.8,
             f"{self.cfg.dst_path}/schedule.jpg"
         )
         update_params = get_update_params(
-            1.0, np.mean(rho[prb.design_elements]), cfg.beta / 10.0
+            1.0,
+            np.mean(rho[prb.design_elements]),
+            cfg.beta / 10.0,
+            0.8
         )
-        p, vol_frac, beta = update_params(cfg, 0)
+        p, vol_frac, beta, move_limit = update_params(cfg, 0)
         K = techniques.assemble_stiffness_matrix(
             prb.basis, rho, prb.E0,
             prb.Emin, p, prb.nu0
@@ -408,7 +428,6 @@ class TopOptimizer():
         eta = cfg.eta
         rho_min = cfg.rho_min
         rho_max = 1.0
-        move_limit = cfg.move_limit
         tolerance = 1e-4
         eps = 1e-6
         # l1 = 1e-5
@@ -420,7 +439,7 @@ class TopOptimizer():
         rho_prev = np.zeros_like(rho)
         for iter in range(1, cfg.max_iters+1):
             print(f"iterations: {iter} / {cfg.max_iters}")
-            p, vol_frac, beta = update_params(cfg, iter)
+            p, vol_frac, beta, move_limit = update_params(cfg, iter)
             rho_prev[:] = rho[:]
             # build stiffnes matrix
             
@@ -503,6 +522,7 @@ class TopOptimizer():
             self.recorder_params.feed_data("p", p)
             self.recorder_params.feed_data("vol_frac", vol_frac)
             self.recorder_params.feed_data("beta", beta)
+            self.recorder_params.feed_data("move_limit", move_limit)
             
             
             
@@ -600,6 +620,9 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--move_limit', '-ML', type=float, default=0.2, help=''
+    )
+    parser.add_argument(
+        '--move_limit_rate', '-MLR', type=float, default=5, help=''
     )
     parser.add_argument(
         '--eta', '-ET', type=float, default=1.0, help=''
