@@ -144,3 +144,148 @@ def create_stress_constraint_function(
         return cval
 
     return stress_constraint
+
+
+
+def ks_aggregator(sigma_vm, alpha=30.0):
+    """
+    The KS function reduces the von Mises stress sequence to a single scalar.
+    σ_KS = (1/alpha) ln(1/n * sig exp(α·σ_e) )
+    """
+    n = len(sigma_vm)
+    exps = np.exp(alpha*sigma_vm)
+    return (1./alpha)*np.log(np.mean(exps))
+
+
+def create_ks_stress_constraint(
+    prb, p, alpha, sigma_allow,
+    rho_global, design_elems
+):
+    """
+    KS(sig) <= sigma_allow
+    """
+    
+    basis, E0, Emin, nu = prb.basis, prb.E0, prb.Emin, prb.nu
+    force_vec, fixed_dofs = prb.F, prb.dirichlet_nodes
+    def constraint(x, grad):
+        # 1) x -> rho_global
+        rho_global[:] = 0.01
+        rho_global[design_elems] = x
+        
+        # 2) FEM解
+        K = assemble_stiffness_matrix_simp(basis, rho_global, E0, Emin, p, nu)
+        K_c, f_c = enforce(K, force_vec, D=fixed_dofs)  # scikit-fem.enforce
+        U_c = spsolve(K_c, f_c)
+        U = unscramble(U_c, fixed_dofs, basis.N)
+
+        # 3) 各要素 von Mises応力 + dσ/dx
+        sigma_vm, dSigma_dX = compute_elementwise_stress_and_sensitivity(
+            basis, U, rho_global, E0, Emin, p, nu, design_elems
+        )
+        
+        # 4) KS本体 & dKS/dσ
+        ks_val, dKS_dSigma = ks_aggregator_with_grad(sigma_vm, alpha)
+        
+        # 5) cval = KS - σ_allow  <= 0
+        cval = ks_val - sigma_allow
+
+        if grad.size > 0:
+            # 6) 連鎖律: dKS/dx[j] = Σ_i [ dKS/dσ[i] * dσ[i]/dx[j] ]
+            n_design = len(x)
+            grad[:] = 0.0
+            for j in range(n_design):
+                # sum_i( dKS_dSigma[i] * dSigma_dX[i, j] )
+                tmp_sum = np.sum( dKS_dSigma * dSigma_dX[:, j] )
+                grad[j] = tmp_sum
+
+        return float(cval)
+
+    return constraint
+
+
+
+def precompute_element_matrices_from_basis_and_density(
+    basis: Basis,
+    rho: np.ndarray,
+    E0: float,
+    Emin: float,
+    p: float,
+    nu: float,
+    elem_func: Callable = simp_interpolation
+):
+    n_elem = basis.nelems
+    dof_per_elem = basis.nodal_dofs.shape[0]
+    K_e_all = np.zeros((n_elem, dof_per_elem, dof_per_elem))
+
+    # Compute SIMP-adjusted Young's modulus
+    E_elem = elem_func(rho, E0, Emin, p)
+    lam_all = (nu * E_elem) / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    mu_all = E_elem / (2.0 * (1.0 + nu))
+
+    @BilinearForm
+    def stiffness_form(u, v, w):
+        strain_u = sym_grad(u)
+        strain_v = sym_grad(v)
+        return w.lam * trace(strain_u) * trace(strain_v) + 2.0 * w.mu * ddot(strain_u, strain_v)
+
+    for j in range(n_elem):
+        print(f"[j={j}] type(basis.elem) =", type(basis.elem))
+        basis_e = basis.with_element(j)
+        lam_j = np.array([[lam_all[j]]])
+        mu_j = np.array([[mu_all[j]]])
+        K_e = stiffness_form.assemble(basis_e, lam=lam_j, mu=mu_j).toarray()
+
+        K_e_all[j] = K_e
+
+    return K_e_all
+
+
+
+def compute_strain_energy_(u, K_e_all, element_dofs):
+    n_elem = element_dofs.shape[0]
+    dof_per_elem = element_dofs.shape[1]
+    strain_energy = np.zeros(n_elem)
+
+    for j in range(n_elem):
+        dofs = element_dofs[j]
+        u_e = u[dofs]
+        K_e = K_e_all[j]
+
+        # print(f"[DEBUG] j={j}, u_e.shape={u_e.shape}, K_e.shape={K_e.shape}")
+        strain_energy[j] = u_e @ (K_e @ u_e)
+    return strain_energy
+
+
+def compute_strain_energy(
+    u: np.ndarray,
+    element_dofs,
+    basis,
+    rho: np.ndarray,
+    E0: float,
+    Emin: float,
+    p: float,
+    nu: float,
+):
+    K_e_all = precompute_element_matrices_from_basis_and_density(
+        basis,
+        rho,
+        E0,
+        Emin,
+        p,
+        nu
+    )
+    return compute_strain_energy_(u, K_e_all, element_dofs)
+
+
+
+
+def precompute_element_matrices(K, element_dofs):
+    n_elem = element_dofs.shape[0]
+    dof_per_elem = element_dofs.shape[1]
+    K_e_all = np.zeros((n_elem, dof_per_elem, dof_per_elem))
+
+    for j in range(n_elem):
+        dofs = element_dofs[j]  # shape: (12,)
+        K_e_all[j] = K[np.ix_(dofs, dofs)]  # shape: (12, 12)
+    
+    return K_e_all

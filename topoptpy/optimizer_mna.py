@@ -1,4 +1,5 @@
 import os
+import inspect
 import math
 import shutil
 import json
@@ -19,33 +20,31 @@ from topoptpy import history
 
 
 @dataclass
-class SIMPConfig():
+class MNAConfig():
     dst_path: str
     record_times: int
     iters: int = 0
     max_iters: int = 1000
-    p: float = 3
+    p: float = 3.0
     vol_frac: float = 0.4 
-    dfilter_radius: float = 0.05
+    dfilter_radius: float = 0.7
     rho_min: float = 1e-3
     rho_max: float = 1.0
     move_limit: float = 0.2
     beta: float = 1.0
     eta: float = 0.3
-    lam: float = 200.0 # 1.0 - 100.0 How important is the stress constraint
+    lam: float = 5.0 # 1.0 - 100.0 How important is the stress constraint
     p_stress: float = 6 # 4- 10 The larger it is, the closer it is to the maximum stress, but the gradient becomes unstable.
     sigma_allow: float = 0.02 # 1.0 or 0.5, depends on spcecific problem. Maximum von Mises stress allowed by the structure (depends on the unit system)
     q: float = 4 # 2 - 4How explosively the penalty increases when the stress is exceeded
 
-    
     @classmethod
-    def from_detaults(
-        cls,
-        **args
-    ):
-        return cls(
-            **args
-        )
+    def from_defaults(cls, **args):
+        sig = inspect.signature(cls)
+        valid_keys = sig.parameters.keys()
+        filtered_args = {k: v for k, v in args.items() if k in valid_keys}
+        return cls(**filtered_args)
+
     
     def export(self, path: str):
         with open(f"{path}/cfg.json", "w") as f:
@@ -54,7 +53,8 @@ class SIMPConfig():
 
 def save_info_on_mesh(
     prb,
-    rho, rho_prev, sigma_v,
+    rho: np.ndarray,
+    rho_prev: np.ndarray,
     beta, eta,
     file_path='levelset.vtk'
 ):
@@ -69,51 +69,29 @@ def save_info_on_mesh(
     element_colors_df2[dirichlet_ele] = 1
     element_colors_df2[F_ele] = 2
     
-    rho_projected = heaviside_projection(
+    rho_projected = techniques.heaviside_projection(
         rho, beta=beta, eta=eta
     )
+    cell_outputs = dict()
+    cell_outputs["rho"] = [rho]
+    cell_outputs["rho-diff"] = [rho - rho_prev]
+    cell_outputs["rho_projected"] = [rho_projected]
+    cell_outputs["desing-fixed"] = [element_colors_df1]
+    cell_outputs["condition"] = [element_colors_df2]
+    # if sigma_v is not None:
+    #     cell_outputs["sigma_v"] = [sigma_v]
     
     meshio_mesh = meshio.Mesh(
         points=mesh.p.T,
         cells=[("tetra", mesh.t.T)],
-        cell_data={
-            "rho": [rho],
-            "rho-diff": [rho - rho_prev],
-            "rho_projected": [rho_projected],
-            "desing-fixed": [element_colors_df1],
-            "condition": [element_colors_df2],
-            "sigma": [sigma_v]
-        }
+        cell_data=cell_outputs
     )
     meshio.write(file_path, meshio_mesh)
 
 
-def heaviside_projection(rho, beta, eta=0.5):
-    """
-    Smooth Heaviside projection.
-    Returns projected density in [0,1].
-    """
-    numerator = np.tanh(beta * eta) + np.tanh(beta * (rho - eta))
-    denominator = np.tanh(beta * eta) + np.tanh(beta * (1.0 - eta))
-    return numerator / (denominator + 1e-12)
-
-
-def heaviside_projection_derivative(rho, beta, eta=0.5):
-    """
-    Derivative of the smooth Heaviside projection w.r.t. rho.
-    d/d(rho)[heaviside_projection(rho)].
-    """
-    # y = tanh( beta*(rho-eta) )
-    # dy/d(rho) = beta*sech^2( ... )
-    # factor from normalization
-    numerator = beta * (1.0 - np.tanh(beta*(rho - eta))**2)
-    denominator = np.tanh(beta*eta) + np.tanh(beta*(1.0 - eta))
-    return numerator / (denominator + 1e-12)
-
-
 def compute_von_mises_stress(basis, U, rho, E0, Emin, p, nu):
     sigma_vm = np.zeros(basis.nelems)
-    E_eff = techniques.ramp_interpolation(rho, E0, Emin, p)
+    E_eff = techniques.ram_interpolation(rho, E0, Emin, p)
     # E_eff = techniques.simp_interpolation(rho, E0, Emin, p)
     # E_eff = Emin + (E0 - Emin) * (rho ** p)
     lam = (nu * E_eff) / ((1 + nu) * (1 - 2 * nu))
@@ -140,65 +118,7 @@ def compute_von_mises_stress(basis, U, rho, E0, Emin, p, nu):
     return sigma_vm
 
 
-def ks_aggregator(sigma_vm, alpha=30.0):
-    """
-    The KS function reduces the von Mises stress sequence to a single scalar.
-    σ_KS = (1/alpha) ln(1/n * sig exp(α·σ_e) )
-    """
-    n = len(sigma_vm)
-    exps = np.exp(alpha*sigma_vm)
-    return (1./alpha)*np.log(np.mean(exps))
-
-
-def create_ks_stress_constraint(
-    prb, p, alpha, sigma_allow,
-    
-    rho_global, design_elems
-):
-    """
-    KS(sig) <= sigma_allow
-    """
-    
-    basis, E0, Emin, nu = prb.basis, prb.E0, prb.Emin, prb.nu
-    force_vec, fixed_dofs = prb.F, prb.dirichlet_nodes
-    def constraint(x, grad):
-        # 1) x -> rho_global
-        rho_global[:] = 0.01
-        rho_global[design_elems] = x
-        
-        # 2) FEM解
-        K = assemble_stiffness_matrix_simp(basis, rho_global, E0, Emin, p, nu)
-        K_c, f_c = enforce(K, force_vec, D=fixed_dofs)  # scikit-fem.enforce
-        U_c = spsolve(K_c, f_c)
-        U = unscramble(U_c, fixed_dofs, basis.N)
-
-        # 3) 各要素 von Mises応力 + dσ/dx
-        sigma_vm, dSigma_dX = compute_elementwise_stress_and_sensitivity(
-            basis, U, rho_global, E0, Emin, p, nu, design_elems
-        )
-        
-        # 4) KS本体 & dKS/dσ
-        ks_val, dKS_dSigma = ks_aggregator_with_grad(sigma_vm, alpha)
-        
-        # 5) cval = KS - σ_allow  <= 0
-        cval = ks_val - sigma_allow
-
-        if grad.size > 0:
-            # 6) 連鎖律: dKS/dx[j] = Σ_i [ dKS/dσ[i] * dσ[i]/dx[j] ]
-            n_design = len(x)
-            grad[:] = 0.0
-            for j in range(n_design):
-                # sum_i( dKS_dSigma[i] * dSigma_dX[i, j] )
-                tmp_sum = np.sum( dKS_dSigma * dSigma_dX[:, j] )
-                grad[j] = tmp_sum
-
-        return float(cval)
-
-    return constraint
-
-
-
-def get_param_update(
+def update_params(
     cfg
 ):
     p_init = 1.0
@@ -213,18 +133,17 @@ def get_param_update(
     
 
 def get_objective(
-    prb, cfg, rho, 
-    p_now, beta_now,
+    prb, cfg, rho: np.ndarray, 
+    p_now: float, beta_now: float,
     recorder
 ):
-    
     e_rho = skfem.ElementTetP1()
     basis_rho = skfem.Basis(prb.mesh, e_rho)
 
     def objective(x, grad):
         
-        recorder.feed_data("beta", beta_now)
-        recorder.feed_data("p", p_now)
+        # recorder.feed_data("beta", beta_now)
+        # recorder.feed_data("p", p_now)
         
         rho_prev = rho.copy()
         
@@ -238,10 +157,10 @@ def get_objective(
         )
         rho_filtered[prb.fixed_elements_in_rho] = 1.0
         rho[:] = rho_filtered
+        rho_projected = techniques.heaviside_projection(rho, beta=beta_now, eta=cfg.eta)
         # recorder.feed_data(
         #     "rho-diff", rho[prb.design_elements] - rho_prev[prb.design_elements]
         # )
-        
         
 
         # rho_filltered[prb.fixed_elements_in_rho] = 1.0
@@ -249,7 +168,8 @@ def get_objective(
 
         # 
         K = techniques.assemble_stiffness_matrix_ramp(
-            prb.basis, rho, prb.E0,
+            prb.basis, 
+            rho_projected, prb.E0,
             prb.Emin, p_now, prb.nu0
         )
         K_e, F_e = skfem.enforce(K, prb.F, D=prb.dirichlet_nodes)
@@ -257,35 +177,60 @@ def get_objective(
         f_free = prb.F[prb.free_nodes]
         compliance = f_free @ U_e[prb.free_nodes]
         
-        sigma_vm = compute_von_mises_stress(
-            # basis_rho,
-            prb.basis,
-            U_e, rho, prb.E0, prb.Emin, p_now, prb.nu0
-        )
-        # Soft Constraint (stress)
-        exceed = np.maximum(0.0, sigma_vm - cfg.sigma_allow)
-        recorder.feed_data(
-            "sigma_vm", sigma_vm
-        )
-        penalty = np.sum(exceed**cfg.q)  # q=2 or 4
-        fval = compliance + cfg.lam * penalty
+        # sigma_vm = compute_von_mises_stress(
+        #     # basis_rho,
+        #     prb.basis,
+        #     U_e,
+        #     rho,
+        #     prb.E0, prb.Emin, p_now, prb.nu0
+        # )
+        # # Soft Constraint (stress)
+        # exceed = np.maximum(0.0, sigma_vm - cfg.sigma_allow)
+        # recorder.feed_data("sigma_vm", sigma_vm)
+        # penalty_sigma = cfg.lam * np.sum(exceed**cfg.q)  # q=2 or 4
+        # penalty_connectivity = 5.0e-2 * techniques.soft_connectivity_penalty(prb.mesh, rho_projected)
+        # penalty_displacement = 5.0e-3 * np.sum(U_e[prb.F_nodes]**2)
+
+        # penalty = penalty_sigma + penalty_connectivity + penalty_displacement
+        
+        # fval = compliance + penalty
+        # recorder.feed_data("penalty_sigma", penalty_sigma)
+        # recorder.feed_data("penalty_connectivity", penalty_connectivity)
+        # recorder.feed_data("penalty_displacement", penalty_displacement)
+        # recorder.feed_data("fval", fval)
+        # fval = compliance
 
         # Penalty p-norm aggregator (stress)
         # pnorm = (np.mean(sigma_vm ** cfg.p_stress)) ** (1./cfg.p_stress)
         # exceed = max(0.0, pnorm - cfg.sigma_allow)
         # penalty = exceed ** cfg.q
         # fval = compliance + cfg.lam * penalty
+        
+        fval = compliance
+        
 
         # Optional: gradient approx (not implemented here, so NLopt uses finite diff)
         if grad.size > 0:
-            rho_projected = heaviside_projection(rho[prb.design_elements], beta=beta_now, eta=cfg.eta) # beta_list = [1, 2, 4]
+            
             # rho[:] = np.clip(rho, cfg.rho_min, 1.0)
-            drho_proj = heaviside_projection_derivative(rho[prb.design_elements], beta=beta_now, eta=cfg.eta)
             strain_energy = techniques.compute_strain_energy_1(
-                U_e, K.toarray(), prb.basis.element_dofs[:, prb.design_elements]
+                U_e, K.toarray(),
+                prb.basis.element_dofs[:, prb.design_elements]
             )
-            dC_drho = - p_now * (prb.E0 - prb.Emin) * (rho_projected ** (p_now - 1)) * strain_energy
-            dC_drho = dC_drho * drho_proj
+            # (dC / d rho_projected)
+            # dC_drho = techniques.dC_drho_simp(
+            #     rho_projected[prb.design_elements], strain_energy, prb.E0, prb.Emin, p_now
+            # )
+            dC_drho_projected = techniques.dC_drho_ramp(
+                rho_projected[prb.design_elements], strain_energy, prb.E0, prb.Emin, p_now
+            )
+            # dC_drho = - p_now * (prb.E0 - prb.Emin) * (rho_projected[prb.design_elements] ** (p_now - 1)) * strain_energy
+            
+            # The derivatives of Heaviside
+            dH = techniques.heaviside_projection_derivative(rho[prb.design_elements], beta=beta_now, eta=cfg.eta)
+
+            # dC / d rho
+            dC_drho = dC_drho_projected * dH
             
             # 
             # dC_drho = np.clip(dC_drho, -100.0, 100.0)
@@ -298,9 +243,9 @@ def get_objective(
             dC_drho /= mean_norm
 
 
-            delta = rho[prb.design_elements] - rho_prev[prb.design_elements]
-            print(f"delta.min={delta.min():.3f}, mean={delta.mean():.6f}, max={delta.max():.3f}")
-            print(f"positive count: {(delta > 0).sum()}, negative count: {(delta < 0).sum()}")
+            # delta = rho[prb.design_elements] - rho_prev[prb.design_elements]
+            # print(f"delta.min={delta.min():.3f}, mean={delta.mean():.6f}, max={delta.max():.3f}")
+            # print(f"positive count: {(delta > 0).sum()}, negative count: {(delta < 0).sum()}")
 
             # dc = np.clip(dc, -100, 100)
 
@@ -325,10 +270,11 @@ def get_objective(
             
             recorder.feed_data("compliance", compliance)
             recorder.feed_data("rho", rho[prb.design_elements])
+            recorder.feed_data("rho_projected", rho_projected)
             recorder.feed_data("strain_energy", strain_energy)
             recorder.feed_data("dC", dC_drho)
             # recorder.feed_data("dp", dp)
-            recorder.feed_data("penalty", penalty)
+            # recorder.feed_data("penalty", penalty)
             recorder.print()
 
 
@@ -338,12 +284,12 @@ def get_objective(
             
             save_info_on_mesh(
                 prb,
-                rho, rho_prev, sigma_vm,
+                rho, rho_prev,
                 beta_now, cfg.eta,
                 f"{cfg.dst_path}/mesh_rho/info_mesh-{str(cfg.iters)}.vtu"
             )
             threshold = 0.5
-            remove_elements = prb.design_elements[rho_projected <= threshold]
+            remove_elements = prb.design_elements[rho_projected[prb.design_elements] <= threshold]
             kept_elements = np.setdiff1d(prb.all_elements, remove_elements)
             utils.export_submesh(prb.mesh, kept_elements, f"{cfg.dst_path}/cubic_top.vtk")
 
@@ -356,11 +302,14 @@ def get_objective(
     return objective
 
 
-def get_volume_constraint(cfg):
+def get_volume_constraint(cfg, beta_now: float):
     def volume_constraint(x, grad):
+        x_projected = techniques.heaviside_projection(
+            x, beta=beta_now, eta=cfg.eta
+        )
         if grad.size > 0:
             grad[:] = 1.0  # or np.ones_like(x)
-        return np.sum(x) - cfg.vol_frac * len(x)
+        return np.sum(x_projected) - cfg.vol_frac * len(x_projected)
     return volume_constraint
 
 
@@ -368,7 +317,7 @@ class TopOptimizer():
     def __init__(
         self,
         prb: problem.SIMPProblem,
-        cfg: SIMPConfig
+        cfg: MNAConfig
     ):
         self.prb = prb
         self.cfg = cfg
@@ -389,13 +338,13 @@ class TopOptimizer():
 
         self.recorder = history.HistoriesLogger(self.cfg.dst_path)
         self.recorder.add("rho")
-        self.recorder.add("sigma_vm")
+        self.recorder.add("rho_projected")
         self.recorder.add("strain_energy")
         self.recorder.add("compliance")
         self.recorder.add("dC")
-        self.recorder.add("penalty")
-        self.recorder.add("p")
-        self.recorder.add("beta")
+        
+        # self.recorder.add("p")
+        # self.recorder.add("beta")
     
     
     def run(
@@ -405,44 +354,25 @@ class TopOptimizer():
         cfg = self.cfg
         rho = np.ones(prb.all_elements.shape)
         x = np.full(len(prb.design_elements), 1.0)
-        # x = np.full(len(prb.design_elements), 0.7)
         x = np.random.uniform(
             0.30, 0.60, size=len(prb.design_elements)
         )
         n_vars = len(x)
-        p, beta = get_param_update(cfg)
-        objective = get_objective(prb, cfg, rho, p, beta, self.recorder)
-        volume_constraint = get_volume_constraint(cfg)
-        opt = nlopt.opt(nlopt.LD_MMA, n_vars)
-        opt.set_lower_bounds(np.full(n_vars, cfg.rho_min))
-        opt.set_upper_bounds(np.full(n_vars, 1.0))
-        opt.set_min_objective(objective)
-        opt.add_inequality_constraint(volume_constraint, 1e-6)
-
-        opt.set_maxeval(1)
-        opt.set_ftol_rel(1e-3)
-        opt.set_xtol_rel(1e-4) 
-
+        
         for it in range(1, cfg.max_iters + 1):
-            print(f"  --- Iteration: {it} / {cfg.max_iters}")
+            print(f" ------ Iteration: {it} / {cfg.max_iters}")
             cfg.iters = it
-            p, beta = get_param_update(cfg)
+            
             # if it % 20 == 0:
                 # cfg.vol_frac = max(0.3, cfg.vol_frac - 0.02)
-            # cons_func = create_stress_constraint_function(
-            #     prb, p,
-            #     allow_stress,
-            #     rho_elem_global, aggregator_p
-            # )
-            volume_constraint = get_volume_constraint(cfg)
-            
             opt = nlopt.opt(nlopt.LD_MMA, n_vars)
+            p, beta = update_params(cfg)
             objective = get_objective(
                 prb, cfg, rho,
                 p, beta,
                 self.recorder
             )
-            volume_constraint = get_volume_constraint(cfg)
+            volume_constraint = get_volume_constraint(cfg, beta)
             # cons_func = create_ks_stress_constraint(
             #     basis, E0, Emin, p, nu,
             #     alpha, sigma_allow,
@@ -558,17 +488,8 @@ if __name__ == '__main__':
     prb = problem.toy2()
     
     
-    cfg = SIMPConfig.from_detaults(
-        dst_path=args.dst_path,
-        record_times=10,
-        max_iters=args.max_iters,
-        p=args.p,
-        vol_frac=args.vol_frac,
-        dfilter_radius=args.dfilter_radius,
-        beta=args.beta,
-        eta=args.eta,
-        rho_min=args.rho_min,
-        move_limit=args.move_limit,
+    cfg = MNAConfig.from_detaults(
+        **vars(args)
     )
 
     optimizer = TopOptimizer(prb, cfg)

@@ -1,4 +1,5 @@
 from typing import Optional
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -37,7 +38,8 @@ class HistoryLogger():
 
 class HistoriesLogger():
     def __init__(
-        self, dst_path: str
+        self,
+        dst_path: str
     ):
         self.dst_path = dst_path
         self.histories = dict()
@@ -68,29 +70,57 @@ class HistoriesLogger():
         if fname is None:
             fname = "progress.jpg"
         plt.clf()
-        rows, cols = 2, 4
-        fig, ax = plt.subplots(rows, cols, figsize=(16, 8))
+        num_graphs = len(self.histories)
+        graphs_per_page = 8
+        num_pages = math.ceil(num_graphs / graphs_per_page)
 
-        for i, k in enumerate(self.histories.keys()):
-            h = self.histories[k]
-            if h.exists():
-                p = i // cols
-                q = i % cols
-                d = np.array(self.histories[k].data)
-                
-                if d.ndim > 1:
-                    ax[p, q].plot(d[:, 0], marker='o', linestyle='-', label="min")
-                    ax[p, q].plot(d[:, 1], marker='o', linestyle='-', label="mean")
-                    ax[p, q].plot(d[:, 2], marker='o', linestyle='-', label="max")
-                    ax[p, q].legend()
-                else:
-                    ax[p, q].plot(d, marker='o', linestyle='-')
+        for page in range(num_pages):
+            page_index = "" if num_pages == 1 else str(page)
+            cols = 4
+            keys = list(self.histories.keys())
+            start = page * cols * 2  # 2 は1ページあたりの行数を想定（ここ固定でもOK）
+            end = min(start + cols * 2, len(keys))  # 最大8個
 
-                ax[p, q].set_xlabel("Iteration")
-                ax[p, q].set_ylabel(h.name)
-                ax[p, q].set_title(f"{h.name} Progress")
-                ax[p, q].grid(True)
+            n_graphs_this_page = end - start
+            rows = math.ceil(n_graphs_this_page / cols)
 
-        fig.tight_layout()
-        fig.savefig(f"{self.dst_path}/{fname}")
-        plt.close("all")
+            fig, ax = plt.subplots(rows, cols, figsize=(16, 4 * rows))
+
+            # flattenしても動くように
+            ax = np.atleast_2d(ax)
+            if ax.ndim == 1:
+                ax = np.reshape(ax, (rows, cols))
+
+            for i in range(start, end):
+                k = keys[i]
+                h = self.histories[k]
+                if h.exists():
+                    idx = i - start
+                    p = idx // cols
+                    q = idx % cols
+                    d = np.array(h.data)
+
+                    if d.ndim > 1:
+                        ax[p, q].plot(d[:, 0], marker='o', linestyle='-', label="min")
+                        ax[p, q].plot(d[:, 1], marker='o', linestyle='-', label="mean")
+                        ax[p, q].plot(d[:, 2], marker='o', linestyle='-', label="max")
+                        ax[p, q].legend()
+                    else:
+                        ax[p, q].plot(d, marker='o', linestyle='-')
+
+                    ax[p, q].set_xlabel("Iteration")
+                    ax[p, q].set_ylabel(h.name)
+                    ax[p, q].set_title(f"{h.name} Progress")
+                    ax[p, q].grid(True)
+
+            # 不要な軸をオフに
+            total_slots = rows * cols
+            used_slots = end - start
+            for j in range(used_slots, total_slots):
+                p = j // cols
+                q = j % cols
+                ax[p, q].axis("off")
+
+            fig.tight_layout()
+            fig.savefig(f"{self.dst_path}/{page_index}{fname}")
+            plt.close("all")

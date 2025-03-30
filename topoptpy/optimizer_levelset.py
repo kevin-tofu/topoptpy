@@ -392,6 +392,11 @@ class TopOptimizer():
                 prb.basis.element_dofs
                 # prb.basis.element_dofs[:, prb.design_elements]
             )
+            # strain_energy = techniques.compute_strain_energy(
+            #     U_e, prb.basis.element_dofs[:, prb.design_elements],
+            #     prb.basis, rho[prb.design_elements],
+            #     prb.E0, prb.Emin, p, prb.nu0
+            # )
 
             # dC/dφ = dC/dρ × dρ/dφ
             # defines dρ/dφ on each node

@@ -24,6 +24,7 @@ class SIMPProblem():
     F: np.ndarray
     design_elements: np.ndarray
     free_nodes: np.ndarray
+    free_elements: np.ndarray
     all_elements: np.ndarray
     fixed_elements_in_rho: np.ndarray
     
@@ -54,7 +55,8 @@ class SIMPProblem():
             cell_data={"highlight": [element_colors_df2]}
         )
         meshio.write(f"{dst_path}/prb_org_dirichlet_f.vtu", mesh_export)
-    
+
+
     @classmethod
     def from_defaults(
         cls,
@@ -93,6 +95,7 @@ class SIMPProblem():
             f"fixed_elements_in_rho: {fixed_elements_in_rho.shape}"
         )
         free_nodes = np.setdiff1d(np.arange(basis.N), dirichlet_nodes)
+        free_elements = utils.get_elements_with_points(mesh, [free_nodes])
         F = np.zeros(basis.N)
         F[F_nodes] = F_value / len(F_nodes)
 
@@ -109,6 +112,7 @@ class SIMPProblem():
             F,
             design_elements,
             free_nodes,
+            free_elements,
             all_elements,
             fixed_elements_in_rho
         )
@@ -184,9 +188,9 @@ def toy2():
     gmsh.initialize()
     x_len = 8.0
     y_len = 12.0
-    z_len = 3
-    mesh_size = 0.8
+    z_len = 3.0
     mesh_size = 0.5
+    # mesh_size = 0.3
 
     gmsh.model.add('plate')
     gmsh.model.occ.addBox(0, 0, 0, x_len, y_len, z_len)
