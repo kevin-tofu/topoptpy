@@ -24,7 +24,6 @@ class OCConfig():
     p_rate: float = 20.0
     vol_frac: float = 0.4  # the maximum valume ratio
     vol_frac_rate: float = 20.0
-    learning_rate: float = 0.01
     beta: float = 8
     beta_rate: float = 20.
     beta_eta: float = 0.3
@@ -465,17 +464,25 @@ class TopOptimizer():
             
             # Compute strain energy and obtain derivatives
             strain_energy = techniques.compute_strain_energy(
-                u, prb.basis.element_dofs[:, prb.design_elements],
-                prb.basis, rho_projected[prb.design_elements],
+                u, 
+                # prb.basis.element_dofs[:, prb.design_elements],
+                # prb.basis, rho_projected[prb.design_elements],
+                prb.basis.element_dofs,
+                prb.basis, rho_projected,
                 prb.E0, prb.Emin, p, prb.nu0
             )
             dC_drho_projected = techniques.dC_drho_ramp(
-                rho_projected[prb.design_elements], strain_energy, prb.E0, prb.Emin, p
+                rho_projected, strain_energy, prb.E0, prb.Emin, p
             )
             dH = techniques.heaviside_projection_derivative(
-                rho[prb.design_elements], beta=beta, eta=cfg.beta_eta
+                rho, beta=beta, eta=cfg.beta_eta
             )
-            dC_drho = dC_drho_projected * dH
+            grad_filtered = dC_drho_projected * dH
+            grad_func, _ = techniques.compute_filter_gradient_matrix(prb.basis, cfg.dfilter_radius)
+            dC_drho = grad_func(grad_filtered)
+            dC_drho = dC_drho[prb.design_elements]
+            # dC_drho = dC_drho
+
             # 
             # Correction with Lagrange multipliers Bisection Method
             # 

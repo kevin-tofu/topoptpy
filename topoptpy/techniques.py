@@ -8,6 +8,8 @@ from scipy.spatial import cKDTree
 from scipy.sparse import csc_matrix
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
+from scipy.sparse import csc_matrix
+from scipy.sparse.linalg import splu
 
 import skfem
 from skfem import MeshTet, Basis, ElementTetP1, asm
@@ -369,6 +371,35 @@ def helmholtz_filter_element_based_tet(rho_element: np.ndarray, basis: Basis, ra
 
     rho_filtered = spsolve(A, rhs)
     return rho_filtered
+
+
+
+def compute_filter_gradient_matrix(basis: Basis, radius: float):
+    """
+    Compute the Jacobian of the Helmholtz filter: d(rho_filtered)/d(rho)
+    """
+    mesh = basis.mesh
+    laplacian, volumes = element_to_element_laplacian_tet(mesh, radius)
+    volumes_normalized = volumes / np.mean(volumes)
+
+    M = csc_matrix(np.diag(volumes_normalized))
+    A = M + radius**2 * laplacian
+
+    # Solve: d(rho_filtered)/d(rho) = A^{-1} * M
+    # You can precompute LU for efficiency
+    A_solver = splu(A)
+
+    def filter_grad_vec(v: np.ndarray) -> np.ndarray:
+        """Applies Jacobian to vector v"""
+        return A_solver.solve(M @ v)
+
+    def filter_jacobian_matrix() -> np.ndarray:
+        """Returns the full Jacobian matrix: A^{-1} @ M"""
+        n = M.shape[0]
+        I = np.eye(n)
+        return np.column_stack([filter_grad_vec(I[:, i]) for i in range(n)])
+
+    return filter_grad_vec, filter_jacobian_matrix
 
 
 
