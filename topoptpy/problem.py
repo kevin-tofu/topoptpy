@@ -186,11 +186,11 @@ def toy2():
     import gmsh
 
     gmsh.initialize()
-    x_len = 8.0
-    y_len = 12.0
+    x_len = 12.0
+    y_len = 6.0
     z_len = 3.0
-    mesh_size = 0.5
-    # mesh_size = 0.3
+    # mesh_size = 0.5
+    mesh_size = 0.3
 
     gmsh.model.add('plate')
     gmsh.model.occ.addBox(0, 0, 0, x_len, y_len, z_len)
@@ -214,11 +214,11 @@ def toy2():
         basis, (0.0, 0.03), (0.0, y_len), (0.0, z_len)
     ).all()
     F_points = utils.get_point_indices_in_range(
-        basis, (x_len, x_len), (y_len*2/5, y_len*3/5), (0.0, z_len/5)
+        basis, (x_len, x_len), (y_len*2/5, y_len*3/5), (z_len*2/5, z_len*3/5)
     )
     F_nodes = utils.get_dofs_in_range(
-        basis, (x_len, x_len), (y_len*2/5, y_len*3/5), (0.0, z_len/5)
-    ).nodal['u^3']
+        basis, (x_len, x_len), (y_len*2/5, y_len*3/5), (z_len*2/5, z_len*3/5)
+    ).nodal['u^2']
     design_elements = utils.get_elements_in_box(
         mesh,
         # (0.3, 0.7), (0.0, 1.0), (0.0, 1.0)
@@ -231,7 +231,7 @@ def toy2():
     # E0 = 2.0e9
     E0 = 1.0
     # F = -1000.0
-    F = -0.3
+    F = 0.3
     return SIMPProblem.from_defaults(
         E0,
         0.30,

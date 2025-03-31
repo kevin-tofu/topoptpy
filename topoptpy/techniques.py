@@ -358,10 +358,9 @@ def element_to_element_laplacian_tet(mesh, radius):
     return laplacian, volumes
 
 
-def helmholtz_filter_element_based_tet(rho_element: np.ndarray, basis: Basis, radius: float) -> np.ndarray:
+def helmholtz_filter_element_based_tet(rho_element: np.ndarray, mesh: skfem.Mesh, radius: float) -> np.ndarray:
     """
     """
-    mesh = basis.mesh
     laplacian, volumes = element_to_element_laplacian_tet(mesh, radius)
     volumes_normalized = volumes / np.mean(volumes)
 
@@ -373,12 +372,10 @@ def helmholtz_filter_element_based_tet(rho_element: np.ndarray, basis: Basis, ra
     return rho_filtered
 
 
-
-def compute_filter_gradient_matrix(basis: Basis, radius: float):
+def compute_filter_gradient_matrix(mesh: skfem.Mesh, radius: float):
     """
     Compute the Jacobian of the Helmholtz filter: d(rho_filtered)/d(rho)
     """
-    mesh = basis.mesh
     laplacian, volumes = element_to_element_laplacian_tet(mesh, radius)
     volumes_normalized = volumes / np.mean(volumes)
 
@@ -401,6 +398,34 @@ def compute_filter_gradient_matrix(basis: Basis, radius: float):
 
     return filter_grad_vec, filter_jacobian_matrix
 
+
+def prepare_helmholtz_filter(mesh: skfem.Mesh, radius: float):
+    """
+    Precompute and return the matrices and solver for Helmholtz filter.
+    """
+    laplacian, volumes = element_to_element_laplacian_tet(mesh, radius)
+    volumes_normalized = volumes / np.mean(volumes)
+
+    M = csc_matrix(np.diag(volumes_normalized))
+    A = M + radius**2 * laplacian
+    A_solver = splu(A)
+    return A_solver, M
+
+
+def apply_helmholtz_filter(rho_element: np.ndarray, solver, M) -> np.ndarray:
+    """
+    Apply the Helmholtz filter using precomputed solver and M.
+    """
+    rhs = M @ rho_element
+    rho_filtered = solver.solve(rhs)
+    return rho_filtered
+
+
+def apply_filter_gradient(v: np.ndarray, solver, M) -> np.ndarray:
+    """
+    Apply the Jacobian of the Helmholtz filter: d(rho_filtered)/d(rho) to a vector.
+    """
+    return solver.solve(M @ v)
 
 
 def compute_strain_energy(

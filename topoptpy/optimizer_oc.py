@@ -143,7 +143,7 @@ def plot_schedule(
     dst_path: str
 ):
     import matplotlib.pyplot as plt
-    update_params = get_update_params(p_init, vol_frac_init, cfg.beta / 100.0, 0.8)
+    update_params = get_update_params(p_init, vol_frac_init, beta_init, max_limit_init)
     p_list = list()
     vol_frac_list = list()
     beta_list = list()
@@ -219,170 +219,6 @@ class TopOptimizer():
         self.recorder_params.add("move_limit")
 
 
-    def run(
-        self
-    ):
-        
-        e_rho = skfem.ElementTetP1()
-        basis_rho = skfem.Basis(prb.mesh, e_rho)
-        rho = np.ones(prb.all_elements.shape)
-        # rho[prb.design_elements] = 0.95
-        # rho[prb.design_elements] = cfg.vol_frac
-        rho[prb.design_elements] = np.random.uniform(
-            0.5, 0.8, size=len(prb.design_elements)
-        )
-        plot_schedule(
-            cfg, 1.0,
-            np.mean(rho[prb.design_elements]),
-            f"{self.cfg.dst_path}/schedule.jpg"
-        )
-        update_params = get_update_params(1.0, np.mean(rho[prb.design_elements]))
-        p, vol_frac = update_params(cfg, 0)
-        K = techniques.assemble_stiffness_matrix(
-            prb.basis, rho, prb.E0,
-            prb.Emin, p, prb.nu0
-        )
-
-        K_e, F_e = skfem.enforce(K, prb.F, D=prb.dirichlet_nodes)
-        u = scipy.sparse.linalg.spsolve(K_e, F_e)
-        f_free = prb.F[prb.free_nodes]
-
-        # Compliance
-        compliance = f_free @ u[prb.free_nodes]
-        self.recorder.feed_data("compliance", compliance)
-        eta = cfg.eta
-        rho_min = cfg.rho_min
-        rho_max = 1.0
-        move_limit = cfg.move_limit
-        tolerance = 1e-4
-        eps = 1e-6
-        # l1 = 1e-5
-        # l2 = 1e5
-        # l1, l2 = 1e-9, 1e9
-        l1, l2 = 1e-9, 1e4
-        # l1, l2 = 1e-4, 1e4
-        # l1, l2 = 1e-5, 1e5
-        rho_prev = np.zeros_like(rho)
-        for iter in range(1, cfg.max_iters+1):
-            print(f"iterations: {iter} / {cfg.max_iters}")
-            p, vol_frac = update_params(cfg, iter)
-            rho_prev[:] = rho[:]
-            # build stiffnes matrix
-            
-            K = techniques.assemble_stiffness_matrix_ramp(
-            # K = techniques.assemble_stiffness_matrix(
-                prb.basis, rho, prb.E0,
-                prb.Emin, p, prb.nu0
-            )
-            K_e, F_e = skfem.enforce(K, prb.F, D=prb.dirichlet_nodes)
-            u = scipy.sparse.linalg.spsolve(K_e, F_e)
-            f_free = prb.F[prb.free_nodes]
-            # Compliance
-            compliance = f_free @ u[prb.free_nodes]
-            
-            rho_filtered = techniques.helmholtz_filter_element_based_tet(
-                rho, basis_rho, cfg.dfilter_radius
-            )
-            rho_filtered[prb.fixed_elements_in_rho] = 1.0
-            rho[:] = rho_filtered
-            # Compute strain energy and obtain derivatives
-            strain_energy = techniques.compute_strain_energy(
-                u, prb.basis.element_dofs[:, prb.design_elements],
-                prb.basis, rho[prb.design_elements],
-                prb.E0, prb.Emin, p, prb.nu0
-            )
-            dC_drho = techniques.dC_drho_simp(
-                rho[prb.design_elements], strain_energy, prb.E0, prb.Emin, p
-            )
-            # 
-            # Correction with Lagrange multipliers Bisection Method
-            # 
-            safe_dC = dC_drho - np.mean(dC_drho)
-            safe_dC = safe_dC / (np.max(np.abs(safe_dC)) + 1e-8)
-            
-            rho_e = rho[prb.design_elements].copy()
-            lmid = 0.5 * (l1 + l2)
-            vol_error = np.mean(rho_e) - vol_frac
-            l1, l2 = 1e-9, 1e9
-            while abs(l2 - l1) > tolerance * (l1 + l2) / 2.0:
-            # while (l2 - l1) / (0.5 * (l1 + l2) + eps) > tolerance:
-            # while abs(vol_error) > 1e-2:
-                lmid = 0.5 * (l1 + l2)
-                scaling_rate = (- safe_dC / (lmid + eps)) ** eta
-                scaling_rate = np.clip(scaling_rate, 0.5, 1.5)
-
-                rho_candidate = np.clip(
-                    rho_e * scaling_rate,
-                    np.maximum(rho_e - move_limit, rho_min),
-                    np.minimum(rho_e + move_limit, rho_max)
-                )
-                vol_error = np.mean(rho_candidate) - vol_frac
-                if vol_error > 0:
-                    l1 = lmid
-                else:
-                    l2 = lmid
-
-            rho_diff = rho - rho_prev
-
-            self.recorder.feed_data("rho_diff", rho_diff[prb.design_elements])
-            self.recorder.feed_data("scaling_rate", scaling_rate)
-            self.recorder.feed_data("rho", rho[prb.design_elements])
-            self.recorder.feed_data("compliance", compliance)
-            self.recorder.feed_data("dC", dC_drho)
-            self.recorder.feed_data("lambda_v", lmid)
-            self.recorder.feed_data("vol_error", vol_error)
-            self.recorder.feed_data("strain_energy", strain_energy)
-            self.recorder_params.feed_data("p", p)
-            self.recorder_params.feed_data("vol_frac", vol_frac)
-            
-            
-            
-            
-            
-            #     noise_strength = 0.03
-            #     # rho[prb.design_elements] += np.random.uniform(
-            #     #     -noise_strength, noise_strength, size=prb.design_elements.shape
-            #     # )
-            #     rho[prb.design_elements] += -safe_dC / (np.abs(safe_dC).max() + 1e-8) * 0.05 \
-            #         + np.random.normal(0, noise_strength, size=prb.design_elements.shape)
-            #     rho[prb.design_elements] = np.clip(rho[prb.design_elements], cfg.rho_min, cfg.rho_max)
-
-            if iter % (cfg.max_iters // self.cfg.record_times) == 0 or iter == 1:
-            # if True:
-                print(f"Saving at iteration {iter}")
-                self.recorder.print()
-                self.recorder_params.print()
-
-                self.recorder.export_progress()
-                self.recorder_params.export_progress("params-sequence.jpg")
-                if True:
-                    
-                    save_info_on_mesh(
-                        prb,
-                        rho, rho_prev,
-                        f"{cfg.dst_path}/mesh_rho/info_mesh-{iter}.vtu"
-                    )
-                    threshold = 0.5
-                    remove_elements = prb.design_elements[rho[prb.design_elements] <= threshold]
-                    kept_elements = np.setdiff1d(prb.all_elements, remove_elements)
-                    utils.export_submesh(prb.mesh, kept_elements, f"{cfg.dst_path}/cubic_top.vtk")
-
-            # https://qiita.com/fujitagodai4/items/7cad31cc488bbb51f895
-
-        utils.rho_histo_plot(
-            rho[prb.design_elements],
-            f"{self.cfg.dst_path}/rho-histo/last.jpg"
-        )
-
-        threshold = 0.05
-        remove_elements = prb.design_elements[rho[prb.design_elements] <= threshold]
-        kept_elements = np.setdiff1d(prb.all_elements, remove_elements)
-        utils.export_submesh(prb.mesh, kept_elements, f"{self.cfg.dst_path}/cubic_top.vtk")
-
-        self.export_mesh(rho, "last")
-
-
-
     def run_ramp(
         self
     ):
@@ -402,14 +238,14 @@ class TopOptimizer():
             cfg,
             1.0, np.mean(rho[prb.design_elements]),
             cfg.beta / 10.0,
-            0.8,
+            0.6,
             f"{self.cfg.dst_path}/schedule.jpg"
         )
         update_params = get_update_params(
             1.0,
             np.mean(rho[prb.design_elements]),
             cfg.beta / 10.0,
-            0.8
+            0.6
         )
         p, vol_frac, beta, move_limit = update_params(cfg, 0)
         K = techniques.assemble_stiffness_matrix(
@@ -420,7 +256,7 @@ class TopOptimizer():
         K_e, F_e = skfem.enforce(K, prb.F, D=prb.dirichlet_nodes)
         u = scipy.sparse.linalg.spsolve(K_e, F_e)
         f_free = prb.F[prb.free_nodes]
-
+        
         # Compliance
         compliance = f_free @ u[prb.free_nodes]
         self.recorder.feed_data("compliance", compliance)
@@ -436,19 +272,21 @@ class TopOptimizer():
         # l1, l2 = 1e-4, 1e4
         # l1, l2 = 1e-5, 1e5
         rho_prev = np.zeros_like(rho)
+        helmholz_solver, M = techniques.prepare_helmholtz_filter(prb.mesh, cfg.dfilter_radius)
         for iter in range(1, cfg.max_iters+1):
             print(f"iterations: {iter} / {cfg.max_iters}")
             p, vol_frac, beta, move_limit = update_params(cfg, iter)
             rho_prev[:] = rho[:]
             # build stiffnes matrix
             
-            rho_filtered = techniques.helmholtz_filter_element_based_tet(
-                rho, basis_rho, cfg.dfilter_radius
-            )
+            # rho_filtered = techniques.helmholtz_filter_element_based_tet(
+            #     rho, basis_rho, cfg.dfilter_radius
+            # )
+            rho_filtered = techniques.apply_helmholtz_filter(rho, helmholz_solver, M)
             rho_filtered[prb.fixed_elements_in_rho] = 1.0
-            rho[:] = rho_filtered
+            # rho[:] = rho_filtered # Soft Filter
             rho_projected = techniques.heaviside_projection(
-                rho, beta=beta, eta=cfg.beta_eta
+                rho_filtered, beta=beta, eta=cfg.beta_eta
             )
             K = techniques.assemble_stiffness_matrix_ramp(
             # K = techniques.assemble_stiffness_matrix(
@@ -475,24 +313,31 @@ class TopOptimizer():
                 rho_projected, strain_energy, prb.E0, prb.Emin, p
             )
             dH = techniques.heaviside_projection_derivative(
-                rho, beta=beta, eta=cfg.beta_eta
+                rho_filtered, beta=beta, eta=cfg.beta_eta
             )
             grad_filtered = dC_drho_projected * dH
-            grad_func, _ = techniques.compute_filter_gradient_matrix(prb.basis, cfg.dfilter_radius)
-            dC_drho = grad_func(grad_filtered)
+            # grad_func, _ = techniques.compute_filter_gradient_matrix(prb.basis, cfg.dfilter_radius)
+            # dC_drho = grad_func(grad_filtered)
+            dC_drho = techniques.apply_filter_gradient(grad_filtered, helmholz_solver, M)
             dC_drho = dC_drho[prb.design_elements]
             # dC_drho = dC_drho
 
             # 
             # Correction with Lagrange multipliers Bisection Method
             # 
+            
+            
             safe_dC = dC_drho - np.mean(dC_drho)
-            safe_dC = safe_dC / (np.max(np.abs(safe_dC)) + 1e-8)
+            norm = np.percentile(np.abs(safe_dC), 95) + 1e-8
+            safe_dC = safe_dC / norm
+            # safe_dC = safe_dC / (np.max(np.abs(safe_dC)) + 1e-8)
+            # safe_dC = np.clip(safe_dC, -1.0, 1.0)
+            # safe_dC = np.clip(safe_dC, -5, 5)
+
             
-            safe_dC = np.clip(safe_dC, -1.0, 1.0)
-            
-            rho_e = rho[prb.design_elements].copy()
-            l1, l2 = 1e-9, 1e4
+            rho_e = rho_projected[prb.design_elements].copy()
+            # l1, l2 = 1e-9, 1e4
+            l1, l2 = 1e-9, 500
             lmid = 0.5 * (l1 + l2)
             while abs(l2 - l1) > tolerance * (l1 + l2) / 2.0:
             # while (l2 - l1) / (0.5 * (l1 + l2) + eps) > tolerance:
